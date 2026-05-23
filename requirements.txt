@@ -1,0 +1,19 @@
+"""
+PandaMINI Core Engine - Requirements
+Production dependencies for the application
+"""
+
+# Core GUI Framework
+PySide6>=6.6.0
+
+# Audio Processing
+sounddevice>=0.4.6
+numpy>=1.24.0
+soundfile>=0.12.1
+
+# MIDI Support
+mido>=1.3.0
+python-rtmidi>=2.5.0
+
+# Optional: For frozen executable builds
+# pyinstaller>=6.0.0
