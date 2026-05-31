@@ -36,21 +36,22 @@ class SampleLoader(QObject):
             self.sample_load_failed.emit(str(path), "File not found")
             return
         
-        # Create worker for this load operation
+        # Create worker and thread for this load operation
         worker = _LoadWorker(str(path), on_complete)
-        worker.moveToThread(QThread())
+        thread = QThread(self)
+        worker.moveToThread(thread)
         
         # Connect signals
         worker.loaded.connect(self._on_sample_loaded)
         worker.failed.connect(self._on_sample_failed)
         
         # Start the thread
-        worker.thread().started.connect(worker.run)
-        worker.finished.connect(worker.thread().quit)
+        thread.started.connect(worker.run)
+        worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
-        worker.thread().finished.connect(worker.thread().deleteLater)
+        thread.finished.connect(thread.deleteLater)
         
-        worker.thread().start()
+        thread.start()
     
     def _on_sample_loaded(self, path: str, data: np.ndarray, sample_rate: int) -> None:
         """Handle successful sample load."""

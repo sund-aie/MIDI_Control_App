@@ -1,4 +1,3 @@
-```
 # Python
 __pycache__/
 *.pyc
@@ -14,6 +13,7 @@ venv/
 
 # Logs
 *.log
+debug_output.log
 
 # Editors
 .vscode/
@@ -29,7 +29,9 @@ build/
 coverage/
 htmlcov/
 
+# App Data
+app/config.json
+
 # OS
 .DS_Store
 Thumbs.db
-```

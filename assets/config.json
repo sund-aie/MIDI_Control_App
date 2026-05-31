@@ -1,0 +1,104 @@
+{
+  "audio": {
+    "soundboard_output": "CABLE Input (VB-Audio Virtual Cable)",
+    "sampler_output": null,
+    "blocksize": 256,
+    "latency": "low",
+    "sample_rate": 48000
+  },
+  "midi": {
+    "input_device": "WORLDE",
+    "channel": 1
+  },
+  "synth": {
+    "octave": 3,
+    "volume": 0.75,
+    "voices": 16
+  },
+  "mixer": {
+    "channels": [
+      {
+        "volume": 0.8,
+        "pan": 0.0,
+        "mute": false,
+        "solo": false
+      },
+      {
+        "volume": 0.8,
+        "pan": 0.0,
+        "mute": false,
+        "solo": false
+      },
+      {
+        "volume": 0.8,
+        "pan": 0.0,
+        "mute": false,
+        "solo": false
+      },
+      {
+        "volume": 0.8,
+        "pan": 0.0,
+        "mute": false,
+        "solo": false
+      }
+    ]
+  },
+  "pads": {
+    "samples": [
+      "C:/Users/SAM22/Downloads/\u0647\u0630\u0627 \u0627\u0643\u0628\u0631 \u0643\u0648\u064a\u062d\u0647 \u0628\u0627\u0644\u0645\u0646\u0637\u0642\u0647.mp3",
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "volumes": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+    ],
+    "modes": [
+      "oneshot",
+      "oneshot",
+      "oneshot",
+      "oneshot",
+      "oneshot",
+      "oneshot",
+      "oneshot",
+      "oneshot"
+    ],
+    "route_mic": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "route_mon": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "window": {
+    "x": null,
+    "y": null,
+    "width": 1280,
+    "height": 720
+  }
+}

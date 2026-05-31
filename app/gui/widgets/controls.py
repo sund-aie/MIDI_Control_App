@@ -3,9 +3,9 @@ PandaMINI Core Engine - Custom Control Widgets
 VU Meter, Faders, Rotary Dials, and Drum Pads
 """
 import numpy as np
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QFrame
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QFrame, QDialog, QLabel, QPushButton, QSlider, QCheckBox, QComboBox, QFileDialog
 from PySide6.QtCore import Qt, QRectF, Signal, QTimer, QPointF
-from PySide6.QtGui import QPainter, QLinearGradient, QColor, QPen, QBrush, QPainterPath, QConicalGradient
+from PySide6.QtGui import QPainter, QLinearGradient, QColor, QPen, QBrush, QPainterPath, QConicalGradient, QFont
 
 
 class VUMeterWidget(QWidget):
@@ -143,11 +143,14 @@ class FaderWidget(QWidget):
         thumb_gradient.setColorAt(0.5, QColor(255, 255, 255, 40))
         thumb_gradient.setColorAt(1, QColor(0, 0, 0, 80))
         
-        painter.fillRoundedRect(thumb_rect, 3, 3, QBrush(thumb_gradient))
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(thumb_gradient))
+        painter.drawRoundedRect(thumb_rect, 3, 3)
         
         # Thumb border
         border_pen = QPen(QColor(255, 255, 255, 60), 1)
         painter.setPen(border_pen)
+        painter.setBrush(Qt.NoBrush)
         painter.drawRoundedRect(thumb_rect, 3, 3)
 
 
@@ -235,23 +238,32 @@ class RotaryDialWidget(QWidget):
 
 
 class DrumPadWidget(QWidget):
-    """Silicone-style drum pad with drag-drop support."""
+    """Silicone-style drum pad with drag-drop and custom settings support."""
     
     pad_triggered = Signal(int)
+    pad_released = Signal(int)
     sample_dropped = Signal(int, str)  # pad_index, file_path
+    pad_config_requested = Signal(int)
     
     def __init__(self, pad_index: int, parent=None):
         super().__init__(parent)
         self._pad_index = pad_index
         self._active = False
         self._has_sample = False
+        self._sample_path = ""
         
         # Colors from design spec
-        self._color_inactive = QColor(255, 255, 255, 20)
-        self._color_active = QColor(255, 191, 0, 102)
-        self._glow_color = QColor(255, 191, 0, 150)
+        self._color_inactive = QColor(255, 255, 255, 12)
+        self._color_active = QColor(255, 191, 0, 150)
+        self._glow_color = QColor(255, 191, 0, 220)
         
         self.setAcceptDrops(True)
+        
+    def set_sample_path(self, path: str) -> None:
+        """Set sample path and update state."""
+        self._sample_path = path
+        self._has_sample = bool(path)
+        self.update()
     
     def set_active(self, active: bool) -> None:
         """Set pad active state."""
@@ -264,7 +276,7 @@ class DrumPadWidget(QWidget):
         self.update()
     
     def mousePressEvent(self, event) -> None:
-        """Trigger pad on click."""
+        """Trigger pad on click — always plays (built-in sounds available)."""
         if event.button() == Qt.LeftButton:
             self._active = True
             self.pad_triggered.emit(self._pad_index)
@@ -272,8 +284,20 @@ class DrumPadWidget(QWidget):
     
     def mouseReleaseEvent(self, event) -> None:
         """Release pad."""
-        self._active = False
-        self.update()
+        if event.button() == Qt.LeftButton:
+            self._active = False
+            self.pad_released.emit(self._pad_index)
+            self.update()
+            
+    def mouseDoubleClickEvent(self, event) -> None:
+        """Open settings on double-click."""
+        if event.button() == Qt.LeftButton:
+            self.pad_config_requested.emit(self._pad_index)
+            
+    def contextMenuEvent(self, event) -> None:
+        """Open settings on right-click."""
+        self.pad_config_requested.emit(self._pad_index)
+        event.accept()
     
     def dragEnterEvent(self, event) -> None:
         """Accept drag enter if it contains URLs."""
@@ -287,41 +311,388 @@ class DrumPadWidget(QWidget):
             file_path = urls[0].toLocalFile()
             if file_path.lower().endswith(('.wav', '.aiff', '.mp3', '.flac')):
                 self.sample_dropped.emit(self._pad_index, file_path)
+                self._sample_path = file_path
                 self._has_sample = True
                 self.update()
     
     def paintEvent(self, event) -> None:
-        """Render drum pad."""
+        """Render drum pad with physical silicone aesthetics."""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         
         # Pad rectangle
         pad_rect = QRectF(4, 4, self.width() - 8, self.height() - 8)
         
+        # Draw glossy pad body
         if self._active:
-            # Active state - amber tint with glow
-            painter.fillRect(pad_rect, QBrush(self._color_active))
+            # Active state - beautiful backlit glow
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(self._color_active))
+            painter.drawRoundedRect(pad_rect, 10, 10)
             
-            # Glow effect
+            # Glow border
             glow_pen = QPen(self._glow_color, 2)
             painter.setPen(glow_pen)
-            painter.drawRoundedRect(pad_rect, 8, 8)
-            
-            # Inner highlight
-            inner_rect = QRectF(8, 8, self.width() - 16, self.height() - 16)
-            inner_color = QColor(255, 191, 0, 50)
-            painter.fillRect(inner_rect, QBrush(inner_color))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRoundedRect(pad_rect, 10, 10)
         else:
-            # Inactive state
-            painter.fillRoundedRect(pad_rect, 8, 8, QBrush(self._color_inactive))
+            # Inactive state - dark translucent silicone
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(self._color_inactive))
+            painter.drawRoundedRect(pad_rect, 10, 10)
             
-            # Border
-            border_pen = QPen(QColor(255, 255, 255, 40), 1)
+            # Subtly backlit if a sample is loaded, otherwise dim border
+            if self._has_sample:
+                border_pen = QPen(QColor(0, 240, 255, 60), 1.5)
+            else:
+                border_pen = QPen(QColor(255, 255, 255, 20), 1)
             painter.setPen(border_pen)
-            painter.drawRoundedRect(pad_rect, 8, 8)
-        
-        # Sample indicator
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRoundedRect(pad_rect, 10, 10)
+            
+        # Draw sample name in the center
+        painter.setFont(QFont("JetBrains Mono", 8, QFont.Bold))
         if self._has_sample:
-            indicator_rect = QRectF(self.width() - 12, 4, 8, 8)
+            import os
+            filename = os.path.basename(self._sample_path) if self._sample_path else f"Pad {self._pad_index + 1}"
+            # Shorten if too long
+            if len(filename) > 11:
+                filename = filename[:9] + ".."
+            
+            painter.setPen(QColor(255, 255, 255, 220) if self._active else QColor(0, 240, 255, 200))
+            painter.drawText(pad_rect, Qt.AlignCenter, filename)
+        else:
+            painter.setPen(QColor(185, 202, 203, 50))
+            painter.drawText(pad_rect, Qt.AlignCenter, f"PAD {self._pad_index + 1}\n(Empty)")
+        
+        # Draw a small corner indicator for hover/edit actions
+        indicator_rect = QRectF(self.width() - 14, 8, 6, 6)
+        if self._has_sample:
             indicator_color = QColor(32, 226, 145) if not self._active else QColor(255, 255, 255)
-            painter.fillRoundedRect(indicator_rect, 2, 2, QBrush(indicator_color))
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(indicator_color))
+            painter.drawRoundedRect(indicator_rect, 1.5, 1.5)
+
+
+class PadConfigDialog(QDialog):
+    """Sleek, transparent, glassmorphic Pad Configuration Dialog."""
+    
+    def __init__(self, pad_index: int, audio_engine, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setFixedSize(400, 420)
+        
+        self._pad_index = pad_index
+        self._audio_engine = audio_engine
+        
+        # Query values from engine
+        self._sample_path = self._audio_engine._pad_sample_paths.get(pad_index, "")
+        self._volume = self._audio_engine._pad_volumes.get(pad_index, 1.0)
+        self._mode = self._audio_engine._pad_modes.get(pad_index, "oneshot")
+        self._route_mic = self._audio_engine._pad_route_mic.get(pad_index, True)
+        self._route_mon = self._audio_engine._pad_route_mon.get(pad_index, True)
+        
+        self._setup_ui()
+        
+    def paintEvent(self, event) -> None:
+        """Render absolute stunning custom glass container."""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        
+        # Outer card background
+        bg_color = QColor(24, 24, 30, 245)
+        rect = QRectF(0, 0, self.width(), self.height())
+        path = QPainterPath()
+        path.addRoundedRect(rect, 16, 16)
+        painter.fillPath(path, QBrush(bg_color))
+        
+        # High-tech glowing cyan border
+        border_pen = QPen(QColor(0, 240, 255, 120), 2)
+        painter.setPen(border_pen)
+        painter.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 16, 16)
+        
+    def _setup_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(16)
+        
+        # Header title
+        header = QHBoxLayout()
+        title = QLabel(f"PAD {self._pad_index + 1} CONFIGURATION")
+        title.setFont(QFont("Geist", 14, QFont.Bold))
+        title.setStyleSheet("color: #00f0ff; letter-spacing: 0.05em;")
+        header.addWidget(title)
+        
+        close_btn = QPushButton("×")
+        close_btn.setFixedSize(24, 24)
+        close_btn.setCursor(Qt.PointingHandCursor)
+        close_btn.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                color: rgba(255, 255, 255, 150);
+                font-size: 20px;
+                border: none;
+            }
+            QPushButton:hover {
+                color: #ff5050;
+            }
+        """)
+        close_btn.clicked.connect(self.reject)
+        header.addWidget(close_btn)
+        layout.addLayout(header)
+        
+        # Divider line
+        div = QFrame()
+        div.setFrameShape(QFrame.HLine)
+        div.setStyleSheet("background-color: rgba(255, 255, 255, 20); height: 1px; border: none;")
+        layout.addWidget(div)
+        
+        # File path field
+        file_layout = QVBoxLayout()
+        file_layout.setSpacing(6)
+        file_label = QLabel("AUDIO SAMPLE SOURCE")
+        file_label.setFont(QFont("JetBrains Mono", 8, QFont.Bold))
+        file_label.setStyleSheet("color: rgba(185, 202, 203, 0.6);")
+        file_layout.addWidget(file_label)
+        
+        file_row = QHBoxLayout()
+        file_row.setSpacing(8)
+        self.path_display = QLabel(self._sample_path if self._sample_path else "(No Sound Loaded)")
+        self.path_display.setFont(QFont("JetBrains Mono", 9))
+        self.path_display.setStyleSheet("""
+            QLabel {
+                background-color: rgba(0, 0, 0, 80);
+                border: 1px solid rgba(255, 255, 255, 12);
+                border-radius: 6px;
+                padding: 6px 10px;
+                color: #dbfcff;
+            }
+        """)
+        file_row.addWidget(self.path_display, 1)
+        
+        browse_btn = QPushButton("BROWSE")
+        browse_btn.setFont(QFont("JetBrains Mono", 9, QFont.Bold))
+        browse_btn.setCursor(Qt.PointingHandCursor)
+        browse_btn.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(0, 240, 255, 30);
+                border: 1px solid rgba(0, 240, 255, 100);
+                border-radius: 6px;
+                color: #00f0ff;
+                padding: 6px 12px;
+            }
+            QPushButton:hover {
+                background-color: rgba(0, 240, 255, 60);
+            }
+        """)
+        browse_btn.clicked.connect(self._on_browse)
+        file_row.addWidget(browse_btn)
+        file_layout.addLayout(file_row)
+        layout.addLayout(file_layout)
+        
+        # Volume slider
+        vol_layout = QVBoxLayout()
+        vol_layout.setSpacing(6)
+        vol_header = QHBoxLayout()
+        vol_label = QLabel("PAD VOLUME / GAIN")
+        vol_label.setFont(QFont("JetBrains Mono", 8, QFont.Bold))
+        vol_label.setStyleSheet("color: rgba(185, 202, 203, 0.6);")
+        vol_header.addWidget(vol_label)
+        
+        self.vol_value_label = QLabel(f"{int(self._volume * 100)}%")
+        self.vol_value_label.setFont(QFont("JetBrains Mono", 9, QFont.Bold))
+        self.vol_value_label.setStyleSheet("color: #00f0ff;")
+        vol_header.addWidget(self.vol_value_label)
+        vol_layout.addLayout(vol_header)
+        
+        self.vol_slider = QSlider(Qt.Horizontal)
+        self.vol_slider.setRange(0, 100)
+        self.vol_slider.setValue(int(self._volume * 100))
+        self.vol_slider.setStyleSheet("""
+            QSlider::groove:horizontal {
+                height: 6px;
+                background: rgba(255, 255, 255, 16);
+                border-radius: 3px;
+            }
+            QSlider::sub-page:horizontal {
+                background: #00f0ff;
+                border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                background: #ffffff;
+                width: 14px;
+                height: 14px;
+                margin-top: -4px;
+                margin-bottom: -4px;
+                border-radius: 7px;
+            }
+        """)
+        self.vol_slider.valueChanged.connect(self._on_vol_changed)
+        vol_layout.addWidget(self.vol_slider)
+        layout.addLayout(vol_layout)
+        
+        # Mode selector
+        mode_layout = QVBoxLayout()
+        mode_layout.setSpacing(6)
+        mode_label = QLabel("PLAYBACK MODE")
+        mode_label.setFont(QFont("JetBrains Mono", 8, QFont.Bold))
+        mode_label.setStyleSheet("color: rgba(185, 202, 203, 0.6);")
+        mode_layout.addWidget(mode_label)
+        
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("One-Shot (Play Entire File)", "oneshot")
+        self.mode_combo.addItem("Gate (Play While Held)", "gate")
+        self.mode_combo.addItem("Loop (Loop Continuously)", "loop")
+        self.mode_combo.setStyleSheet("""
+            QComboBox {
+                background-color: rgba(0, 0, 0, 80);
+                border: 1px solid rgba(255, 255, 255, 12);
+                border-radius: 6px;
+                padding: 6px 12px;
+                color: #dbfcff;
+                font-family: 'JetBrains Mono';
+                font-size: 11px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #1e1e24;
+                border: 1px solid rgba(0, 240, 255, 100);
+                color: #dbfcff;
+                selection-background-color: rgba(0, 240, 255, 50);
+            }
+        """)
+        # Select current mode
+        idx = self.mode_combo.findData(self._mode)
+        if idx >= 0:
+            self.mode_combo.setCurrentIndex(idx)
+        mode_layout.addWidget(self.mode_combo)
+        layout.addLayout(mode_layout)
+        
+        # Routing checklist
+        route_layout = QVBoxLayout()
+        route_layout.setSpacing(8)
+        route_label = QLabel("AUDIO ROUTING CHANNELS")
+        route_label.setFont(QFont("JetBrains Mono", 8, QFont.Bold))
+        route_label.setStyleSheet("color: rgba(185, 202, 203, 0.6);")
+        route_layout.addWidget(route_label)
+        
+        self.chk_mic = QCheckBox("Send to Discord / Mic Output (Virtual Cable)")
+        self.chk_mic.setFont(QFont("JetBrains Mono", 9))
+        self.chk_mic.setChecked(self._route_mic)
+        self.chk_mic.setStyleSheet("""
+            QCheckBox {
+                color: #dbfcff;
+            }
+            QCheckBox::indicator {
+                width: 16px;
+                height: 16px;
+                background-color: rgba(0, 0, 0, 80);
+                border: 1px solid rgba(255, 255, 255, 20);
+                border-radius: 4px;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #00f0ff;
+                border: 1px solid #00f0ff;
+            }
+        """)
+        route_layout.addWidget(self.chk_mic)
+        
+        self.chk_mon = QCheckBox("Monitor in Headphones / Local Output")
+        self.chk_mon.setFont(QFont("JetBrains Mono", 9))
+        self.chk_mon.setChecked(self._route_mon)
+        self.chk_mon.setStyleSheet("""
+            QCheckBox {
+                color: #dbfcff;
+            }
+            QCheckBox::indicator {
+                width: 16px;
+                height: 16px;
+                background-color: rgba(0, 0, 0, 80);
+                border: 1px solid rgba(255, 255, 255, 20);
+                border-radius: 4px;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #00f0ff;
+                border: 1px solid #00f0ff;
+            }
+        """)
+        route_layout.addWidget(self.chk_mon)
+        layout.addLayout(route_layout)
+        
+        layout.addSpacing(4)
+        
+        # Save / Cancel Actions
+        actions = QHBoxLayout()
+        actions.setSpacing(12)
+        
+        cancel_btn = QPushButton("CANCEL")
+        cancel_btn.setFont(QFont("JetBrains Mono", 10, QFont.Bold))
+        cancel_btn.setCursor(Qt.PointingHandCursor)
+        cancel_btn.setStyleSheet("""
+            QPushButton {
+                background-color: transparent;
+                border: 1px solid rgba(255, 255, 255, 30);
+                border-radius: 8px;
+                color: rgba(255, 255, 255, 180);
+                padding: 8px 16px;
+            }
+            QPushButton:hover {
+                border-color: rgba(255, 255, 255, 80);
+                color: #ffffff;
+            }
+        """)
+        cancel_btn.clicked.connect(self.reject)
+        actions.addWidget(cancel_btn)
+        
+        save_btn = QPushButton("SAVE CONFIG")
+        save_btn.setFont(QFont("JetBrains Mono", 10, QFont.Bold))
+        save_btn.setCursor(Qt.PointingHandCursor)
+        save_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #00f0ff;
+                border: none;
+                border-radius: 8px;
+                color: #121216;
+                padding: 8px 16px;
+            }
+            QPushButton:hover {
+                background-color: #5effff;
+            }
+        """)
+        save_btn.clicked.connect(self._on_save)
+        actions.addWidget(save_btn)
+        
+        layout.addLayout(actions)
+        
+    def _on_vol_changed(self, val: int) -> None:
+        self.vol_value_label.setText(f"{val}%")
+        
+    def _on_browse(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Pad Sound Sample",
+            "",
+            "Audio Files (*.wav *.mp3 *.flac *.aiff)"
+        )
+        if path:
+            self._sample_path = path
+            self.path_display.setText(path)
+            
+    def _on_save(self) -> None:
+        """Apply and save configurations to engine."""
+        self._volume = self.vol_slider.value() / 100.0
+        self._mode = self.mode_combo.currentData()
+        self._route_mic = self.chk_mic.isChecked()
+        self._route_mon = self.chk_mon.isChecked()
+        
+        # Apply changes to audio engine
+        if self._sample_path:
+            # Set path map synchronously to prevent async visual race condition
+            self._audio_engine._pad_sample_paths[self._pad_index] = self._sample_path
+            self._audio_engine.load_pad_sample(self._pad_index, self._sample_path)
+            
+        self._audio_engine.set_pad_volume(self._pad_index, self._volume)
+        self._audio_engine.set_pad_mode(self._pad_index, self._mode)
+        self._audio_engine.set_pad_routing(self._pad_index, self._route_mic, self._route_mon)
+        
+        self.accept()

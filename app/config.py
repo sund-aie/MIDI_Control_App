@@ -45,6 +45,9 @@ class ConfigManager(QObject):
         'pads': {
             'samples': [None] * 8,
             'volumes': [1.0] * 8,
+            'modes': ['oneshot'] * 8,
+            'route_mic': [True] * 8,
+            'route_mon': [True] * 8,
         },
         'window': {
             'x': None,

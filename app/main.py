@@ -28,7 +28,7 @@ class PandaMiniApp:
         
         # Initialize core components
         self._config_manager = ConfigManager()
-        self._audio_engine = AudioEngine()
+        self._audio_engine = AudioEngine(config_manager=self._config_manager)
         self._midi_listener = MidiListener()
         
         # Create main window
@@ -80,20 +80,26 @@ class PandaMiniApp:
         # Restore window position from config if available
         self._restore_window_position()
         
-        # Start MIDI listener with configured device
+        # Start MIDI listener with configured device or auto-detect first device
         midi_device = self._config_manager.get('midi', 'input_device')
+        available = self._midi_listener.get_available_devices()
+        
+        if not midi_device and available:
+            # Auto-select the first available device (e.g. WORLDE)
+            midi_device = available[0]
+            self._config_manager.set(midi_device, 'midi', 'input_device', trigger_save=True)
+            
         if midi_device:
             self._midi_listener.start_listening(midi_device)
         
-        # Start audio streams with configured devices
+        # Start audio streams with configured devices (None = system default)
         sampler_device = self._config_manager.get('audio', 'sampler_output')
         soundboard_device = self._config_manager.get('audio', 'soundboard_output')
         
-        if sampler_device or soundboard_device:
-            self._audio_engine.start_streams(
-                sampler_device=sampler_device,
-                soundboard_device=soundboard_device
-            )
+        self._audio_engine.start_streams(
+            sampler_device=sampler_device,
+            soundboard_device=soundboard_device
+        )
     
     def _restore_window_position(self) -> None:
         """Restore window position from saved config."""
@@ -117,7 +123,7 @@ class PandaMiniApp:
         timer.timeout.connect(lambda: None)
         timer.start(500)  # Check every 500ms
         
-        return self._app.exec_()
+        return self._app.exec()
     
     def shutdown(self) -> None:
         """Clean shutdown of all components."""
