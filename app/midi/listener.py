@@ -58,20 +58,27 @@ class MidiListener(QObject):
     
     note_on = Signal(int, int)  # note, velocity
     note_off = Signal(int, int)  # note, velocity  
+    pad_on = Signal(int, int)   # pad_index (0-7), velocity
+    pad_off = Signal(int)       # pad_index (0-7)
     control_change = Signal(int, int, int)  # channel, cc, value
     program_change = Signal(int, int)  # channel, program
     midi_error = Signal(str)
     device_list_updated = Signal(list)
     
-    # MIDI mappings for Worlde Panda MINI
-    KEY_NOTE_START = 48  # C3
-    KEY_NOTE_END = 72    # C5
-    PAD_NOTE_START = 36  # C2
-    PAD_NOTE_END = 43    # G#2
+    # Panda MINI GM Drum pad mapping (note -> pad index)
+    # These are the actual MIDI notes sent by each physical pad
+    PAD_NOTE_TO_INDEX = {
+        36: 0,   # Kick         → Pad 1
+        38: 1,   # Snare        → Pad 2
+        42: 2,   # Closed HH    → Pad 3
+        46: 3,   # Open HH      → Pad 4
+        45: 4,   # Low Tom      → Pad 5
+        48: 5,   # Hi Tom       → Pad 6
+        51: 6,   # Ride Cymbal  → Pad 7
+        49: 7,   # Crash Cymbal → Pad 8
+    }
     
-    # CC mappings
-    FADER_CC_MAP = {10: 0, 11: 1, 12: 2, 13: 3}  # CC 10-13 -> Channel 0-3
-    KNOB_CC_MAP = {20: 0, 21: 1, 22: 2, 23: 3}   # CC 20-23 -> Parameter 0-3
+    DRUM_CHANNEL = 9  # MIDI channel 10 (0-indexed = 9)
     
     def __init__(self, parent: Optional[QObject] = None):
         super().__init__(parent)
@@ -226,16 +233,16 @@ class MidiListener(QObject):
         msg_type = status & 0xF0
         channel = status & 0x0F
         
-        # Route signals
+        # Route by message type and channel
         if msg_type == 0x90:  # Note On
             if data2 > 0:
-                self._handle_note_on(data1, data2)
+                self._route_note_on(channel, data1, data2)
             else:
-                self._handle_note_off(data1, 0)
+                self._route_note_off(channel, data1)
         elif msg_type == 0x80:  # Note Off
-            self._handle_note_off(data1, data2)
+            self._route_note_off(channel, data1)
         elif msg_type == 0xB0:  # Control Change
-            self._handle_control_change(data1, data2)
+            self.control_change.emit(channel, data1, data2)
         elif msg_type == 0xC0:  # Program Change
             self.program_change.emit(channel, data1)
             
@@ -244,43 +251,39 @@ class MidiListener(QObject):
         if not self._running:
             return
             
-        msg_type = msg.type
-        if msg_type == 'note_on':
+        if msg.type == 'note_on':
+            ch = getattr(msg, 'channel', 0)
             if msg.velocity > 0:
-                self._handle_note_on(msg.note, msg.velocity)
+                self._route_note_on(ch, msg.note, msg.velocity)
             else:
-                self._handle_note_off(msg.note, 0)
-        elif msg_type == 'note_off':
-            self._handle_note_off(msg.note, msg.velocity)
-        elif msg_type == 'control_change':
-            self._handle_control_change(msg.control, msg.value)
-        elif msg_type == 'program_change':
+                self._route_note_off(ch, msg.note)
+        elif msg.type == 'note_off':
+            ch = getattr(msg, 'channel', 0)
+            self._route_note_off(ch, msg.note)
+        elif msg.type == 'control_change':
+            self.control_change.emit(msg.channel, msg.control, msg.value)
+        elif msg.type == 'program_change':
             self.program_change.emit(msg.channel, msg.value)
             
-    def _handle_note_on(self, note: int, velocity: int) -> None:
-        """Distribute keys vs trigger pads notes."""
-        if self.KEY_NOTE_START <= note <= self.KEY_NOTE_END:
-            self.note_on.emit(note, velocity)
-        elif self.PAD_NOTE_START <= note <= self.PAD_NOTE_END:
-            self.note_on.emit(note, velocity)
+    def _route_note_on(self, channel: int, note: int, velocity: int) -> None:
+        """Route note-on by channel: drum channel → pads, else → keyboard."""
+        if channel == self.DRUM_CHANNEL:
+            # Check if this note maps to a pad
+            pad_idx = self.PAD_NOTE_TO_INDEX.get(note, -1)
+            if pad_idx >= 0:
+                self.pad_on.emit(pad_idx, velocity)
+                return
+        # Everything else is a keyboard/synth note
+        self.note_on.emit(note, velocity)
             
-    def _handle_note_off(self, note: int, velocity: int) -> None:
-        if self.KEY_NOTE_START <= note <= self.KEY_NOTE_END:
-            self.note_off.emit(note, velocity)
-        elif self.PAD_NOTE_START <= note <= self.PAD_NOTE_END:
-            self.note_off.emit(note, velocity)
-            
-    def _handle_control_change(self, cc: int, value: int) -> None:
-        # Faders (CC 10-13)
-        if 10 <= cc <= 13:
-            channel = cc - 10
-            self.control_change.emit(channel, cc, value)
-        # Knobs (CC 20-23)
-        elif 20 <= cc <= 23:
-            param = cc - 20
-            self.control_change.emit(param, cc, value)
-        else:
-            self.control_change.emit(-1, cc, value)
+    def _route_note_off(self, channel: int, note: int) -> None:
+        """Route note-off by channel."""
+        if channel == self.DRUM_CHANNEL:
+            pad_idx = self.PAD_NOTE_TO_INDEX.get(note, -1)
+            if pad_idx >= 0:
+                self.pad_off.emit(pad_idx)
+                return
+        self.note_off.emit(note, 0)
             
     def refresh_devices(self) -> None:
         """Hot-plug detection: scan ports and emit list changes."""

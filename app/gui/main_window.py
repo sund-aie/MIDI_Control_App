@@ -405,6 +405,8 @@ class MainWindow(QMainWindow):
         if self._midi_listener:
             self._midi_listener.note_on.connect(self._on_midi_note_on)
             self._midi_listener.note_off.connect(self._on_midi_note_off)
+            self._midi_listener.pad_on.connect(self._on_midi_pad_on)
+            self._midi_listener.pad_off.connect(self._on_midi_pad_off)
             self._midi_listener.control_change.connect(self._on_midi_cc)
             self._midi_listener.device_list_updated.connect(self._on_midi_devices_updated)
             self._update_midi_status()
@@ -485,34 +487,28 @@ class MainWindow(QMainWindow):
         )
         
     def _on_midi_note_on(self, note: int, velocity: int) -> None:
-        """Handle hardware MIDI note on event."""
-        # Process synth key (Note 48-72)
-        if 48 <= note <= 72:
-            shifted_note = note + (self._octave_offset * 12)
-            self._audio_engine.trigger_synth_note(shifted_note, velocity)
-            self._keyboard.trigger_note(note)
-            
-        # Process soundboard pad (Note 36-43)
-        elif 36 <= note <= 43:
-            pad_idx = note - 36
-            self._audio_engine.trigger_pad(pad_idx)
-            if pad_idx < len(self._pads):
-                self._pads[pad_idx].set_active(True)
+        """Handle MIDI keyboard note on (synth keys only — pads handled separately)."""
+        shifted_note = note + (self._octave_offset * 12)
+        self._audio_engine.trigger_synth_note(shifted_note, velocity)
+        self._keyboard.trigger_note(note)
                 
     def _on_midi_note_off(self, note: int, velocity: int) -> None:
-        """Handle hardware MIDI note off event."""
-        # Release synth key
-        if 48 <= note <= 72:
-            shifted_note = note + (self._octave_offset * 12)
-            self._audio_engine.release_synth_note(shifted_note)
-            self._keyboard.release_note(note)
-            
-        # Release soundboard pad
-        elif 36 <= note <= 43:
-            pad_idx = note - 36
+        """Handle MIDI keyboard note off."""
+        shifted_note = note + (self._octave_offset * 12)
+        self._audio_engine.release_synth_note(shifted_note)
+        self._keyboard.release_note(note)
+    
+    def _on_midi_pad_on(self, pad_idx: int, velocity: int) -> None:
+        """Handle MIDI drum pad on — index is already correctly mapped."""
+        if 0 <= pad_idx < len(self._pads):
+            self._audio_engine.trigger_pad(pad_idx)
+            self._pads[pad_idx].set_active(True)
+    
+    def _on_midi_pad_off(self, pad_idx: int) -> None:
+        """Handle MIDI drum pad off."""
+        if 0 <= pad_idx < len(self._pads):
             self._audio_engine.release_pad(pad_idx)
-            if pad_idx < len(self._pads):
-                self._pads[pad_idx].set_active(False)
+            self._pads[pad_idx].set_active(False)
                 
     def _on_midi_cc(self, channel: int, cc: int, value: int) -> None:
         """Handle hardware knobs/faders control change."""
