@@ -57,10 +57,11 @@ def test_empty_pad_does_nothing(engine):
     assert engine.trigger_pad(3) == "empty"
 
 
-def test_each_output_keeps_its_own_position(engine):
+def test_each_output_keeps_its_own_position(engine, qtbot):
     """Regression: both outputs used to share one play position, garbling the Discord feed."""
     hp, mic = attach(engine, (ROLE_HEADPHONES, 48000), (ROLE_MIC, 44100))
     engine._install(0, sound(seconds=0.05))
+    qtbot.waitUntil(lambda: any(c[0] == "fill" for c in mic.commands), timeout=5000)  # resampled off-thread
     engine.settings[0].volume = 1.0
     engine.trigger_pad(0)
     out_hp = render(hp, blocks=10)
@@ -175,16 +176,50 @@ def test_synth_only_on_headphones(engine):
     assert not render(hp).any()
 
 
-def test_output_never_clips_and_meter_reads(engine):
+def test_limiter_keeps_stacked_pads_clean_and_meter_reads(engine):
     (bus,) = attach(engine, (ROLE_HEADPHONES, 48000))
     for i in range(8):
         engine._install(i, sound(value=0.9))
         engine.settings[i].volume = 1.0
         engine.trigger_pad(i)
-    out = render(bus)
-    assert np.max(np.abs(out)) <= 1.0
-    assert engine.output_state()[ROLE_HEADPHONES]["peak"] == pytest.approx(1.0)
+    out = render(bus, blocks=4)
+    assert np.max(np.abs(out)) <= 0.95 + 1e-6                    # limited, not hard-clipped
+    assert np.allclose(out[:, 0], out[0, 0])                     # steady level, no pumping
+    assert engine.output_state()[ROLE_HEADPHONES]["peak"] == pytest.approx(0.95, abs=1e-3)
     assert engine.output_state()[ROLE_HEADPHONES]["peak"] == 0.0   # reading resets
+
+
+def test_limiter_recovers_after_loud_burst(engine):
+    (bus,) = attach(engine, (ROLE_HEADPHONES, 48000))
+    for i in range(4):
+        engine._install(i, sound(seconds=0.02, value=0.9))
+        engine.settings[i].volume = 1.0
+        engine.trigger_pad(i)
+    render(bus, blocks=3)
+    engine._install(5, sound(seconds=1, value=0.5))
+    engine.settings[5].volume = 1.0
+    engine.trigger_pad(5)
+    out = render(bus, blocks=40)                                 # 0.4 s > release time
+    assert out[-1, 0] == pytest.approx(0.5, abs=1e-3)
+
+
+def test_unticking_mic_stops_a_playing_sound_there(engine):
+    hp, mic = attach(engine, (ROLE_HEADPHONES, 48000), (ROLE_MIC, 48000))
+    engine._install(0, sound(seconds=2))
+    engine.settings[0].mode = "loop"
+    engine.trigger_pad(0)
+    assert render(mic).any()
+    engine.settings[0].to_mic = False
+    render(mic, blocks=2)
+    assert not render(mic).any()
+    assert render(hp, blocks=3)[-10:].any()
+
+
+def test_sound_keeps_only_rates_in_use(engine, qtbot):
+    hp, = attach(engine, (ROLE_HEADPHONES, 48000))
+    snd = PadSound(np.full((44100, 2), 0.3, dtype=np.float32), 44100, "x")
+    engine._install(0, snd)
+    qtbot.waitUntil(lambda: snd.cached(48000) is not None and snd.cached(44100) is None, timeout=5000)
 
 
 def test_mono_device_gets_a_downmix(engine):

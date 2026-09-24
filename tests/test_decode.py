@@ -12,9 +12,21 @@ def test_mono_wav_becomes_normalised_stereo(wav):
     assert abs(np.max(np.abs(data)) - PEAK_TARGET) < 1e-3
 
 
-def test_multichannel_keeps_front_pair(wav):
-    data, _ = decode_file(wav(channels=6, name="surround.wav"))
-    assert data.shape[1] == 2
+def test_surround_keeps_centre_dialogue(tmp_path):
+    import soundfile as sf
+    n = 4800
+    data = np.zeros((n, 6), dtype=np.float32)
+    data[:, 2] = 0.5 * np.sin(np.arange(n) / 5)                   # sound only in the centre channel
+    sf.write(str(tmp_path / "51.wav"), data, 48000)
+    out, _ = decode_file(tmp_path / "51.wav")
+    assert out.shape[1] == 2 and np.allclose(out[:, 0], out[:, 1]) and np.max(np.abs(out)) > 0.5
+
+
+def test_quiet_files_are_not_boosted_into_noise(wav):
+    data, _ = decode_file(wav(amp=0.01, name="quiet.wav"))
+    assert np.max(np.abs(data)) == pytest.approx(0.08, rel=0.01)  # +18 dB cap
+    with pytest.raises(DecodeError):
+        decode_file(wav(amp=0.0005, name="hiss.wav"))
 
 
 def test_unicode_file_name(wav):

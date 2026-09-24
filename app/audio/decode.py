@@ -13,9 +13,11 @@ import numpy as np
 
 log = logging.getLogger(__name__)
 
-MAX_SECONDS = 10 * 60          # longest sound a pad keeps (RAM guard)
+MAX_SECONDS = 5 * 60           # longest sound a pad keeps (RAM guard)
 MAX_COPY_BYTES = 200 * 1024 ** 2  # bigger files are used in place, not copied
-PEAK_TARGET = 0.9              # every sound is normalised to this peak
+PEAK_TARGET = 0.9              # sounds are normalised towards this peak ...
+MAX_GAIN = 8.0                 # ... but never boosted more than +18 dB (hiss stays hiss)
+SILENCE_PEAK = 1e-3            # quieter than -60 dBFS counts as "no usable sound"
 
 FILE_FILTER = (
     "Sound or video files (*.wav *.mp3 *.ogg *.oga *.opus *.flac *.m4a *.aac *.wma "
@@ -70,26 +72,27 @@ def _decode_av(path: Path) -> Tuple[np.ndarray, int]:
             raise DecodeError("This file has no sound in it.")
         stream = container.streams.audio[0]
         rate = int(stream.codec_context.sample_rate or stream.rate or 48000)
-        resampler = av.AudioResampler(format="fltp", layout="stereo", rate=rate)
-        limit = MAX_SECONDS * rate
+        # packed float stereo: to_ndarray() is interleaved L R L R ...
+        resampler = av.AudioResampler(format="flt", layout="stereo", rate=rate)
+        limit = MAX_SECONDS * rate * 2
         chunks, total = [], 0
         for frame in container.decode(stream):
             frame.pts = None
             for out in _frames(resampler.resample(frame)):
-                chunk = out.to_ndarray()
+                chunk = out.to_ndarray().reshape(-1)
                 chunks.append(chunk)
-                total += chunk.shape[-1]
+                total += chunk.shape[0]
             if total >= limit:
                 break
         try:
             for out in _frames(resampler.resample(None)):
-                chunks.append(out.to_ndarray())
+                chunks.append(out.to_ndarray().reshape(-1))
         except Exception:
             pass
     if not chunks:
         raise DecodeError("This file has no sound in it.")
-    data = np.concatenate([c.reshape(2, -1) for c in chunks], axis=1).T
-    return data[:limit], rate
+    data = np.concatenate(chunks)[:limit]
+    return data[:data.shape[0] // 2 * 2].reshape(-1, 2), rate
 
 
 def _frames(result):
@@ -105,15 +108,29 @@ def _finish(data: np.ndarray, rate: int) -> Tuple[np.ndarray, int]:
     if data.shape[1] == 1:
         data = np.repeat(data, 2, axis=1)
     elif data.shape[1] > 2:
-        data = data[:, :2]
-    data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
+        data = _downmix(data)
+    data = np.ascontiguousarray(data)
+    np.nan_to_num(data, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
     if data.shape[0] == 0 or rate <= 0:
         raise DecodeError("This file has no sound in it.")
     peak = float(np.max(np.abs(data)))
-    if peak < 1e-6:
-        raise DecodeError("This file is silent.")
-    data *= PEAK_TARGET / peak
-    return np.ascontiguousarray(data, dtype=np.float32), int(rate)
+    if peak < SILENCE_PEAK:
+        raise DecodeError("This file is silent (or nearly silent).")
+    data *= min(PEAK_TARGET / peak, MAX_GAIN)
+    return data, int(rate)
+
+
+def _downmix(data: np.ndarray) -> np.ndarray:
+    """Surround to stereo. 5.1/7.1 (L R C LFE Ls Rs [Lb Rb]) keep the centre (dialogue)."""
+    ch = data.shape[1]
+    if ch in (6, 8):
+        c = 0.707 * data[:, 2]
+        left = data[:, 0] + c + 0.707 * data[:, 4:ch:2].sum(axis=1)
+        right = data[:, 1] + c + 0.707 * data[:, 5:ch:2].sum(axis=1)
+    else:
+        rest = data[:, 2:].mean(axis=1)
+        left, right = data[:, 0] + 0.707 * rest, data[:, 1] + 0.707 * rest
+    return np.stack([left, right], axis=1)
 
 
 def resample(data: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:

@@ -83,6 +83,7 @@ class MainWindow(QMainWindow):
         self._last_activity = 0.0
         self._prog_until = 0.0
         self._last_unmatched = 0.0
+        self._last_output_check = 0.0
         self._keys_held = set()
         self._last_dir = ""
         self._started = False
@@ -161,6 +162,11 @@ class MainWindow(QMainWindow):
         help_button.setToolTip("How to send the pads into Discord")
         help_button.clicked.connect(self._show_discord_help)
         row.addWidget(help_button)
+        refresh = QToolButton(objectName="help")
+        refresh.setText("↻")
+        refresh.setToolTip("Look again for headphones / audio devices plugged in after the app started")
+        refresh.clicked.connect(lambda: self._reopen_outputs(rescan=True))
+        row.addWidget(refresh)
         row.addStretch(1)
         self.hp_combo.activated.connect(lambda _: self._on_output_picked())
         self.mic_combo.activated.connect(lambda _: self._on_output_picked())
@@ -252,6 +258,11 @@ class MainWindow(QMainWindow):
             self.device.sliders[i].set_value(cfg["levels"][key])
         self.device.keyboard.set_base_note(cfg["keyboard"]["base_note"])
 
+        # Outputs first, so the loader resamples straight to their rates.
+        self._autodetect_mic()
+        self._fill_output_combos()
+        self._open_outputs()
+
         library = paths.library_dir()
         for i in range(NUM_PADS):
             self._apply_pad_settings(i)
@@ -260,10 +271,6 @@ class MainWindow(QMainWindow):
                 self.device.pads[i].set_loading()
                 # also pulls sounds from older versions (e.g. in Downloads) into the library
                 self.engine.load_pad(i, pad_cfg["file"], import_fn=lambda p: import_to_library(p, library))
-
-        self._autodetect_mic()
-        self._fill_output_combos()
-        self._open_outputs()
 
         self.midi.set_control_map(self.config.control_map())
         self.midi.start(cfg["midi"]["input_device"])
@@ -320,6 +327,14 @@ class MainWindow(QMainWindow):
         audio["mic_output"] = self.mic_combo.currentData() or ""
         self.config.changed()
         self._open_outputs()
+
+    def _reopen_outputs(self, rescan: bool, reason: str = "") -> None:
+        if rescan:
+            self.engine.rescan_devices()
+            self._fill_output_combos()
+        self._open_outputs()
+        if reason and not self.engine.lost_outputs():
+            self.statusBar().showMessage(reason, 8000)
 
     def _open_outputs(self) -> None:
         audio = self.config.data["audio"]
@@ -380,7 +395,9 @@ class MainWindow(QMainWindow):
                 pad_cfg["file"] = info
                 pad_cfg["name"] = Path(requested).stem
                 self.config.changed()
-                self.statusBar().showMessage(f"Pad {i + 1} is ready: {pad_cfg['name']}", 6000)
+                sound = self.engine.sounds[i]
+                note = " (only the first 5 minutes are used)" if sound is not None and sound.truncated else ""
+                self.statusBar().showMessage(f"Pad {i + 1} is ready: {pad_cfg['name']}{note}", 8000)
             elif pad_cfg["file"] == requested and info != requested:
                 pad_cfg["file"] = info             # now points at the library copy
                 self.config.changed()
@@ -540,6 +557,12 @@ class MainWindow(QMainWindow):
         self.mic_meter.push(mic["peak"] if mic else 0.0, bool(mic and mic["running"]))
         if now - self._last_activity > 0.08:
             self.device.set_led(0, False)
+        if now - self._last_output_check > 3.0:
+            self._last_output_check = now
+            lost = self.engine.lost_outputs()
+            if lost:
+                log.warning("Output stream(s) stopped: %s; reopening", lost)
+                self._reopen_outputs(rescan=True, reason="An audio device changed; sound outputs were reopened.")
         if self._prog_until and now > self._prog_until:
             self._prog_until = 0.0
             self.device.buttons["PROG"].set_lit(False)

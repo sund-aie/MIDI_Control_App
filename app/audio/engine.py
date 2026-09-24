@@ -8,12 +8,14 @@ Threading
   deque; they never touch audio buffers.
 - Every output has its own PortAudio callback thread that drains its deque and
   mixes its own voices, so the two outputs never share play positions.
-- Decoding and resampling run on worker threads; results come back to the GUI
-  thread through a queued Qt signal.
+- Decoding and resampling run one job at a time on a single worker thread (so
+  they can't crowd the audio callbacks off the GIL); results come back to the
+  GUI thread through queued Qt signals.
 """
 import collections
 import logging
 import math
+import queue
 import threading
 import time
 from dataclasses import dataclass
@@ -23,13 +25,12 @@ from typing import Callable, Dict, List, Optional
 import numpy as np
 from PySide6.QtCore import QObject, Signal, Slot
 
-from app.audio.decode import DecodeError, decode_file, resample
+from app.audio.decode import MAX_SECONDS, DecodeError, decode_file, resample
 
 try:
     import sounddevice as sd
-except Exception as e:  # PortAudio missing
+except Exception:  # PortAudio missing
     sd = None
-    _SD_ERROR = str(e)
 
 log = logging.getLogger(__name__)
 
@@ -37,13 +38,16 @@ NUM_PADS = 8
 MODES = ("oneshot", "toggle", "hold", "loop")
 MAX_PAD_VOICES = 24
 FADE_SECONDS = 0.006
-# Seconds of audio queued ahead of the speakers. Enough headroom that a busy GUI
-# thread holding the GIL can't starve the callback, still tight enough for pads.
+# Seconds of audio queued ahead of the speakers (WASAPI). Enough headroom that a
+# busy GUI thread holding the GIL can't starve the callback, tight enough for pads.
 OUTPUT_LATENCY = 0.03
+LIMIT = 0.95                  # limiter ceiling so stacked pads don't hard-clip
+LIMITER_RELEASE = 0.12        # seconds
 
 ROLE_HEADPHONES = "headphones"
 ROLE_MIC = "mic"
 ROLE_BOTH = "both"
+VIRTUAL_OUTPUT_HINTS = ("cable", "voicemeeter", "virtual")
 
 
 @dataclass
@@ -55,23 +59,39 @@ class PadSettings:
 
 
 class PadSound:
-    """A decoded sound plus resampled copies for each output rate."""
+    """A decoded sound, kept only at the sample rates the open outputs use."""
 
     def __init__(self, data: np.ndarray, rate: int, path: str):
-        self.data = data
-        self.rate = rate
         self.path = path
         self.duration = data.shape[0] / float(rate)
+        self.truncated = self.duration >= MAX_SECONDS - 0.05
         self._cache: Dict[int, np.ndarray] = {rate: data}
         self._lock = threading.Lock()
 
+    def cached(self, rate: int) -> Optional[np.ndarray]:
+        with self._lock:
+            return self._cache.get(rate)
+
     def at_rate(self, rate: int) -> np.ndarray:
+        """Frames at `rate`, resampling (slow for long sounds: worker thread only)."""
         with self._lock:
             out = self._cache.get(rate)
-            if out is None:
-                out = resample(self.data, self.rate, rate)
-                self._cache[rate] = out
-            return out
+            if out is not None:
+                return out
+            src_rate = max(self._cache)
+            src = self._cache[src_rate]
+        out = resample(src, src_rate, rate)
+        with self._lock:
+            return self._cache.setdefault(rate, out)
+
+    def trim(self, rates) -> None:
+        """Drop copies no open output uses (keeps at least one to resample from)."""
+        rates = set(rates)
+        with self._lock:
+            if rates & set(self._cache):
+                for r in list(self._cache):
+                    if r not in rates:
+                        del self._cache[r]
 
 
 class _Voice:
@@ -151,6 +171,8 @@ class OutputBus:
         self.stream = None
         self.error = ""
         self.peak = 0.0
+        self.limiter_gain = 1.0
+        self._release_per_frame = 1.0
         self._buf = np.zeros((4096, 2), dtype=np.float32)
 
     # ── lifecycle ───────────────────────────────────────────────
@@ -161,21 +183,29 @@ class OutputBus:
             return False
         last_error = "No usable output device."
         for device, rate, extra in _stream_attempts(self.device):
-            self._prepare(rate)
+            stream = None
             try:
                 info = sd.query_devices(device if device is not None else sd.default.device[1])
                 channels = max(1, min(2, int(info["max_output_channels"])))
+                latency = OUTPUT_LATENCY
+                if "WASAPI" not in _host_api_name(device):
+                    latency = max(OUTPUT_LATENCY, float(info["default_low_output_latency"]))
                 stream = sd.OutputStream(
                     device=device, samplerate=rate, channels=channels, dtype="float32",
-                    latency=OUTPUT_LATENCY, extra_settings=extra, callback=self._callback,
+                    latency=latency, extra_settings=extra, callback=self._callback,
                 )
+                self._prepare(int(stream.samplerate))
                 stream.start()
             except Exception as e:
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
                 last_error = str(e)
                 log.info("Output %s: device %s @ %s Hz failed: %s", self.role, device, rate, e)
                 continue
             self.stream = stream
-            self.samplerate = int(stream.samplerate)
             log.info("Output %s open: %s @ %d Hz (%s)", self.role, self.name, self.samplerate,
                      _host_api_name(device))
             return True
@@ -183,12 +213,14 @@ class OutputBus:
         return False
 
     def _prepare(self, rate: int) -> None:
+        """Set the rate and fill the bank with what is already resampled (never resamples)."""
         self.samplerate = int(rate)
         self.fade_frames = max(1, int(FADE_SECONDS * rate))
-        self.bank = [s.at_rate(self.samplerate) if s is not None else None
-                     for s in self.engine.sounds]
+        self._release_per_frame = 1.0 / (LIMITER_RELEASE * rate)
+        self.bank = [s.cached(self.samplerate) if s is not None else None for s in self.engine.sounds]
         self.voices = []
         self.commands.clear()
+        self.limiter_gain = 1.0
         self.synth = _Synth(self.samplerate) if self.role in (ROLE_HEADPHONES, ROLE_BOTH) else None
 
     def close(self) -> None:
@@ -224,26 +256,45 @@ class OutputBus:
         buf.fill(0.0)
 
         if self.voices:
-            settings = self.engine.settings
+            engine = self.engine
+            settings = engine.settings
+            for v in self.voices:
+                if v.fade_left is None and not engine.routes(v.pad, self.role):
+                    v.fade_left = self.fade_frames      # routing switched off while playing
             self.voices = [v for v in self.voices
                            if self._render_voice(v, buf, frames, settings[v.pad].volume)]
-            gain = self.engine.pad_gain(self.role)
+            gain = engine.pad_gain(self.role)
             if gain != 1.0:
                 buf *= gain
         if self.synth is not None and self.synth.voices:
             self.synth.render(buf, frames, self.engine.keys_gain())
 
-        np.clip(buf, -1.0, 1.0, out=buf)
+        if frames:
+            self._limit(buf, frames)
         if outdata.shape[1] == 1:
             outdata[:, 0] = buf.mean(axis=1)
         else:
             outdata[:, :2] = buf
             if outdata.shape[1] > 2:
                 outdata[:, 2:] = 0.0
-        if frames:
-            peak = float(np.max(np.abs(buf)))
-            if peak > self.peak:
-                self.peak = peak
+
+    def _limit(self, buf: np.ndarray, frames: int) -> None:
+        """Peak limiter: instant attack, smooth release, then a hard safety clip."""
+        peak = float(np.max(np.abs(buf)))
+        wanted = 1.0 if peak <= LIMIT else LIMIT / peak
+        old = self.limiter_gain
+        if wanted < old:
+            buf *= wanted
+            new = wanted
+        else:
+            new = min(wanted, old + self._release_per_frame * frames)
+            if new != 1.0 or old != 1.0:
+                buf *= np.linspace(old, new, frames, dtype=np.float32)[:, None]
+        self.limiter_gain = new
+        np.clip(buf, -1.0, 1.0, out=buf)
+        out_peak = min(1.0, peak * new)
+        if out_peak > self.peak:
+            self.peak = out_peak
 
     def _render_voice(self, v: _Voice, buf: np.ndarray, frames: int, volume: float) -> bool:
         data = v.data
@@ -300,6 +351,10 @@ class OutputBus:
                 _, pad, data = cmd
                 self.bank[pad] = data
                 self._fade_pad(pad)
+            elif op == "fill":
+                _, pad, data = cmd
+                if self.bank[pad] is None:       # late resample: don't cut a playing sound
+                    self.bank[pad] = data
             elif op == "note_on" and self.synth is not None:
                 self.synth.note_on(cmd[1], cmd[2])
             elif op == "note_off" and self.synth is not None:
@@ -311,11 +366,32 @@ class OutputBus:
                 v.fade_left = self.fade_frames
 
 
+class _Worker:
+    """One background thread running jobs in order (decode, resample, copy)."""
+
+    def __init__(self):
+        self._jobs: "queue.Queue[Callable[[], None]]" = queue.Queue()
+        self._thread = threading.Thread(target=self._run, name="audio-loader", daemon=True)
+        self._thread.start()
+
+    def submit(self, job: Callable[[], None]) -> None:
+        self._jobs.put(job)
+
+    def _run(self) -> None:
+        while True:
+            job = self._jobs.get()
+            try:
+                job()
+            except Exception:
+                log.exception("Background audio job failed")
+
+
 class AudioEngine(QObject):
     """Owns the output buses, the pad sounds and the play state of every pad."""
 
     pad_loaded = Signal(int, bool, str, str)   # pad, ok, path (ok) / message (failed), request path
     _load_done = Signal(int, int, object, str, str)
+    _rates_ready = Signal(int, object)
 
     def __init__(self, parent: Optional[QObject] = None):
         super().__init__(parent)
@@ -327,7 +403,9 @@ class AudioEngine(QObject):
         self._play_until = [0.0] * NUM_PADS
         self._started = [0.0] * NUM_PADS
         self._tokens = [0] * NUM_PADS
+        self._worker = _Worker()
         self._load_done.connect(self._on_load_done)
+        self._rates_ready.connect(self._on_rates_ready)
 
     # ── outputs ─────────────────────────────────────────────────
 
@@ -339,7 +417,7 @@ class AudioEngine(QObject):
         try:
             api = _preferred_host_api()
             names = []
-            for i, dev in enumerate(sd.query_devices()):
+            for dev in sd.query_devices():
                 if dev["max_output_channels"] > 0 and (api is None or dev["hostapi"] == api):
                     if dev["name"] not in names:
                         names.append(dev["name"])
@@ -355,21 +433,44 @@ class AudioEngine(QObject):
                 return name
         return None
 
+    def rescan_devices(self) -> None:
+        """Let PortAudio see devices plugged in/out since start (closes the outputs)."""
+        self.close()
+        if sd is None:
+            return
+        try:
+            sd._terminate()
+            sd._initialize()
+        except Exception as e:
+            log.warning("Rescanning audio devices failed: %s", e)
+
     def set_outputs(self, headphones: Optional[str], mic: Optional[str]) -> Dict[str, str]:
         """(Re)open the outputs. headphones=None means system default; mic=None/'' means off.
 
-        Returns {role: error message} for outputs that failed to open.
+        Returns {role: message} for outputs that failed to open or were adjusted.
         """
         self.close()
+        errors = {}
         hp_index = _resolve_output(headphones) if headphones else _default_output()
         hp_name = headphones or "System default"
-        mic_index = _resolve_output(mic) if mic else None
-        errors = {}
         if headphones and hp_index is None:
             errors[ROLE_HEADPHONES] = f"'{headphones}' was not found; using the system default."
             hp_index, hp_name = _default_output(), "System default"
+        mic_index = _resolve_output(mic) if mic else None
         if mic and mic_index is None:
             errors[ROLE_MIC] = f"'{mic}' was not found."
+
+        if not headphones and hp_index is not None and _is_virtual(_device_name(hp_index)):
+            # Installing VB-Cable often makes it Windows' default playback device.
+            real = _first_real_output()
+            if real is not None:
+                hp_index, hp_name = real, _device_name(real)
+                errors[ROLE_HEADPHONES] = (f"Windows' default playback device is a virtual cable, so "
+                                           f"you'll hear the pads on '{hp_name}'. Pick your headphones "
+                                           f"above if that's wrong.")
+            else:
+                errors[ROLE_HEADPHONES] = ("Windows' default playback device is a virtual cable. "
+                                           "Pick your real headphones above.")
 
         if mic_index is not None and mic_index == hp_index:
             buses = [OutputBus(self, ROLE_BOTH, hp_index, hp_name)]
@@ -387,6 +488,7 @@ class AudioEngine(QObject):
                 errors[role] = f"Couldn't open '{bus.name}': {bus.error}"
         with self._lock:
             self._buses = tuple(opened)
+        self._fill_missing_rates()
         return errors
 
     def close(self) -> None:
@@ -395,6 +497,10 @@ class AudioEngine(QObject):
             self._play_until = [0.0] * NUM_PADS
         for bus in buses:
             bus.close()
+
+    def lost_outputs(self) -> List[str]:
+        """Roles whose stream stopped by itself (device unplugged, format changed ...)."""
+        return [bus.role for bus in self._buses if not bus.running]
 
     def output_state(self) -> Dict[str, dict]:
         """{role: {'running': bool, 'peak': float}} — reading resets the peaks."""
@@ -491,7 +597,7 @@ class AudioEngine(QObject):
 
     def load_pad(self, pad: int, path: str,
                  import_fn: Optional[Callable[[Path], Path]] = None) -> None:
-        """Decode `path` on a worker thread, then put it on the pad.
+        """Decode `path` on the worker thread, then put it on the pad.
 
         import_fn (optional) runs on the worker after a successful decode and
         returns the path to remember (e.g. a copy in the sound library).
@@ -499,14 +605,15 @@ class AudioEngine(QObject):
         """
         self._tokens[pad] += 1
         token = self._tokens[pad]
-        rates = {bus.samplerate for bus in self._buses if bus.samplerate}
 
-        def work():
+        def job():
+            if token != self._tokens[pad]:
+                return                      # replaced before it started
             try:
                 data, rate = decode_file(path)
                 sound = PadSound(data, rate, str(path))
-                for r in rates:
-                    sound.at_rate(r)
+                for bus in self._buses:
+                    sound.at_rate(bus.samplerate)
                 stored = Path(path)
                 if import_fn is not None:
                     stored = import_fn(stored)
@@ -514,11 +621,13 @@ class AudioEngine(QObject):
                 self._load_done.emit(pad, token, sound, "", str(path))
             except DecodeError as e:
                 self._load_done.emit(pad, token, None, str(e), str(path))
+            except MemoryError:
+                self._load_done.emit(pad, token, None, "This file is too big to load.", str(path))
             except Exception as e:
                 log.exception("Loading %s failed", path)
                 self._load_done.emit(pad, token, None, f"Couldn't load this file ({e}).", str(path))
 
-        threading.Thread(target=work, name=f"load-pad-{pad + 1}", daemon=True).start()
+        self._worker.submit(job)
 
     @Slot(int, int, object, str, str)
     def _on_load_done(self, pad: int, token: int, sound, message: str, requested: str) -> None:
@@ -535,12 +644,44 @@ class AudioEngine(QObject):
         self._install(pad, None)
 
     def _install(self, pad: int, sound: Optional[PadSound]) -> None:
-        prepared = [(bus, sound.at_rate(bus.samplerate) if sound else None) for bus in self._buses]
         with self._lock:
             self.sounds[pad] = sound
             self._play_until[pad] = 0.0
-            for bus, data in prepared:
+            for bus in self._buses:
+                data = sound.cached(bus.samplerate) if sound else None
                 bus.commands.append(("set", pad, data))
+        if sound is not None:
+            self._fill_missing_rates([pad])
+
+    def _fill_missing_rates(self, pads=None) -> None:
+        """Resample (on the worker) for any open output rate a sound lacks."""
+        rates = {bus.samplerate for bus in self._buses}
+        for pad in (range(NUM_PADS) if pads is None else pads):
+            sound = self.sounds[pad]
+            if sound is None:
+                continue
+            if all(sound.cached(r) is not None for r in rates):
+                sound.trim(rates)
+                continue
+
+            def job(pad=pad, sound=sound, rates=rates):
+                for r in rates:
+                    sound.at_rate(r)
+                self._rates_ready.emit(pad, sound)
+
+            self._worker.submit(job)
+
+    @Slot(int, object)
+    def _on_rates_ready(self, pad: int, sound) -> None:
+        if self.sounds[pad] is not sound:
+            return
+        rates = set()
+        for bus in self._buses:
+            data = sound.cached(bus.samplerate)
+            rates.add(bus.samplerate)
+            if data is not None:
+                bus.commands.append(("fill", pad, data))
+        sound.trim(rates)
 
 
 # ── PortAudio helpers ───────────────────────────────────────────
@@ -565,6 +706,17 @@ def _host_api_name(device: Optional[int]) -> str:
         return "?"
 
 
+def _device_name(index: Optional[int]) -> str:
+    try:
+        return sd.query_devices(index)["name"] if index is not None else ""
+    except Exception:
+        return ""
+
+
+def _is_virtual(name: str) -> bool:
+    return any(h in name.lower() for h in VIRTUAL_OUTPUT_HINTS)
+
+
 def _default_output() -> Optional[int]:
     if sd is None:
         return None
@@ -578,6 +730,22 @@ def _default_output() -> Optional[int]:
         return idx if idx is not None and idx >= 0 else None
     except Exception:
         return None
+
+
+def _first_real_output() -> Optional[int]:
+    """A physical output (headphones/speakers first) in the preferred host API."""
+    try:
+        api = _preferred_host_api()
+        outputs = [(i, d["name"]) for i, d in enumerate(sd.query_devices())
+                   if d["max_output_channels"] > 0 and (api is None or d["hostapi"] == api)
+                   and not _is_virtual(d["name"])]
+    except Exception:
+        return None
+    for hint in ("headphone", "headset", "speaker"):
+        for i, name in outputs:
+            if hint in name.lower():
+                return i
+    return outputs[0][0] if outputs else None
 
 
 def _resolve_output(name: str) -> Optional[int]:
@@ -610,8 +778,7 @@ def _stream_attempts(device: Optional[int]):
         return
     rate = int(info["default_samplerate"] or 48000)
     yield device, rate, None
-    api_name = _host_api_name(device)
-    if "WASAPI" in api_name:
+    if "WASAPI" in _host_api_name(device):
         try:
             yield device, 48000, sd.WasapiSettings(auto_convert=True)
         except TypeError:
