@@ -1,5 +1,5 @@
 """One drum pad: shows its sound, lights up while playing, accepts any dropped file."""
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetricsF, QPainter, QPainterPath, QPen, QTextOption
 from PySide6.QtWidgets import QWidget
 
@@ -13,7 +13,7 @@ class PadWidget(QWidget):
     released = Signal(int)
     add_requested = Signal(int)          # empty pad clicked
     menu_requested = Signal(int, object)  # pad, global QPoint
-    file_dropped = Signal(int, str)
+    files_dropped = Signal(int, list, bool)   # pad, local paths, a web link was dropped too
 
     def __init__(self, index: int, parent=None):
         super().__init__(parent)
@@ -115,7 +115,7 @@ class PadWidget(QWidget):
         self.update()
 
     def dragEnterEvent(self, e) -> None:
-        if any(u.isLocalFile() for u in e.mimeData().urls()):
+        if e.mimeData().hasUrls():
             e.acceptProposedAction()
             self._drag_over = True
             self.update()
@@ -127,11 +127,12 @@ class PadWidget(QWidget):
     def dropEvent(self, e) -> None:
         self._drag_over = False
         self.update()
-        for url in e.mimeData().urls():
-            if url.isLocalFile():
-                e.acceptProposedAction()
-                self.file_dropped.emit(self.index, url.toLocalFile())
-                return
+        urls = e.mimeData().urls()
+        local = [u.toLocalFile() for u in urls if u.isLocalFile()]
+        web = any(not u.isLocalFile() for u in urls)
+        e.acceptProposedAction()
+        # Handle it after the drop returns: a dialog inside dropEvent would freeze Explorer.
+        QTimer.singleShot(0, lambda: self.files_dropped.emit(self.index, local, web))
 
     # ── painting ────────────────────────────────────────────────
 

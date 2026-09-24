@@ -116,7 +116,69 @@ def test_big_files_are_stored_as_flac_of_the_decoded_sound(tmp_path, wav, monkey
 
 def test_half_written_copies_are_cleaned(tmp_path):
     from app.audio.decode import clean_library
-    (tmp_path / "clip.mp4.part").write_bytes(b"x")
+    (tmp_path / "clip.mp4.pandamini-tmp").write_bytes(b"x")
     (tmp_path / "keep.wav").write_bytes(b"x")
     clean_library(tmp_path)
     assert [p.name for p in tmp_path.iterdir()] == ["keep.wav"]
+
+
+def _encode(av, path, codec, rate=44100, seconds=2.0, layout="mono", fmt=None):
+    with av.open(str(path), "w", format=fmt) as out:
+        stream = out.add_stream(codec, rate=rate)
+        stream.layout = layout
+        n = int(rate * seconds)
+        t = np.arange(n) / rate
+        ch = 1 if layout == "mono" else 2
+        samples = np.tile((0.5 * np.sin(2 * np.pi * 330 * t)).astype(np.float32), (ch, 1))
+        frame = av.AudioFrame.from_ndarray(samples, format="fltp", layout=layout)
+        frame.sample_rate = rate
+        for packet in stream.encode(frame):
+            out.mux(packet)
+        for packet in stream.encode(None):
+            out.mux(packet)
+
+
+def test_joined_mp3s_are_decoded_in_full(tmp_path):
+    av = pytest.importorskip("av")
+    a, b = tmp_path / "a.mp3", tmp_path / "b.mp3"
+    _encode(av, a, "mp3", seconds=1.0)
+    _encode(av, b, "mp3", seconds=2.0)
+    joined = tmp_path / "joined.mp3"
+    joined.write_bytes(a.read_bytes() + b.read_bytes())          # "copy /b a.mp3+b.mp3"
+    data, rate = decode_file(joined)
+    assert data.shape[0] / rate > 2.8
+
+
+def test_damaged_packets_are_skipped(tmp_path):
+    av = pytest.importorskip("av")
+    clip = tmp_path / "clip.ts"
+    _encode(av, clip, "mp2", seconds=3.0, fmt="mpegts")
+    raw = bytearray(clip.read_bytes())
+    for k in range(len(raw) // 3, len(raw) // 3 + 2000):         # scribble over the middle
+        raw[k] = 0xFF
+    broken = tmp_path / "broken.ts"
+    broken.write_bytes(bytes(raw))
+    data, rate = decode_file(broken)
+    assert data.shape[0] / rate > 1.5
+
+
+def test_truncated_download_keeps_what_decodes(tmp_path):
+    av = pytest.importorskip("av")
+    clip = tmp_path / "full.mp3"
+    _encode(av, clip, "mp3", seconds=4.0)
+    part = tmp_path / "song.mp3.part"                            # an unfinished browser download
+    part.write_bytes(clip.read_bytes()[: clip.stat().st_size * 2 // 3])
+    data, rate = decode_file(part)
+    assert 2.0 < data.shape[0] / rate < 3.5
+
+
+def test_wav_with_unfinished_header_falls_back_to_ffmpeg(tmp_path, wav):
+    pytest.importorskip("av")
+    good = wav(seconds=1.0, name="good.wav")
+    raw = bytearray(good.read_bytes())
+    k = raw.find(b"data")
+    raw[k + 4:k + 8] = b"\x00\x00\x00\x00"                       # recorder crashed before finishing
+    bad = tmp_path / "crashed.wav"
+    bad.write_bytes(bytes(raw))
+    data, rate = decode_file(bad)
+    assert data.shape[0] / rate > 0.5

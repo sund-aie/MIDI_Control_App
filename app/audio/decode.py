@@ -19,6 +19,7 @@ MAX_COPY_BYTES = 200 * 1024 ** 2  # bigger files are used in place, not copied
 PEAK_TARGET = 0.9              # sounds are normalised towards this peak ...
 MAX_GAIN = 8.0                 # ... but never boosted more than +18 dB (hiss stays hiss)
 SILENCE_PEAK = 1e-3            # quieter than -60 dBFS counts as "no usable sound"
+TMP_SUFFIX = ".pandamini-tmp"  # half-written library copies (removed on start)
 
 FILE_FILTER = (
     "Sound or video files (*.wav *.mp3 *.ogg *.oga *.opus *.flac *.m4a *.m4b *.m4r *.aac *.wma "
@@ -34,26 +35,35 @@ class DecodeError(Exception):
 
 
 def decode_file(path) -> Tuple[np.ndarray, int]:
-    """Return (frames, samplerate): frames is float32, shape (n, 2), peak-normalised."""
+    """Return (frames, samplerate): frames is float32, shape (n, 2), peak-normalised.
+
+    soundfile goes first (fast) except for MP3s, whose length libsndfile can
+    misjudge (joined files, VBR without a header); FFmpeg gets the next try.
+    """
     path = Path(path)
     if not path.is_file():
-        raise DecodeError("The file doesn't exist any more.")
-
-    try:
-        data, rate = _decode_soundfile(path)
-    except Exception as sf_error:
-        log.info("soundfile could not read %s (%s); trying FFmpeg", path.name, sf_error)
+        raise DecodeError(MISSING)
+    if path.suffix.lower() in (".mp3", ".mp2", ".mpga"):
+        attempts = (_decode_av, _decode_soundfile)
+    else:
+        attempts = (_decode_soundfile, _decode_av)
+    message = "This file has no playable sound in it."
+    for attempt in attempts:
         try:
-            data, rate = _decode_av(path)
-        except DecodeError:
-            raise
+            data, rate = attempt(path)
+            return _finish(data, rate)
         except ImportError:
-            raise DecodeError("This file type needs FFmpeg support (pip install av).")
-        except Exception as av_error:
-            log.warning("FFmpeg could not read %s: %s", path.name, av_error)
-            raise DecodeError("This file has no playable sound in it.") from av_error
+            message = "This file type needs FFmpeg support (pip install av)."
+        except DecodeError as e:
+            message = str(e)
+        except MemoryError:
+            raise DecodeError("This file is too big to load.")
+        except Exception as e:
+            log.info("%s could not read %s: %s", attempt.__name__, path.name, e)
+    raise DecodeError(message)
 
-    return _finish(data, rate)
+
+MISSING = "The file doesn't exist any more."
 
 
 def _decode_soundfile(path: Path) -> Tuple[np.ndarray, int]:
@@ -68,34 +78,85 @@ def _decode_soundfile(path: Path) -> Tuple[np.ndarray, int]:
 
 
 def _decode_av(path: Path) -> Tuple[np.ndarray, int]:
+    """FFmpeg: best audio track first, then any other track that has sound."""
     import av
 
     with av.open(str(path)) as container:
-        if not container.streams.audio:
+        tracks = list(container.streams.audio)
+        if not tracks:
             raise DecodeError("This file has no sound in it.")
-        stream = container.streams.audio[0]
+        try:
+            best = tracks.index(container.streams.best("audio"))
+        except (ValueError, Exception):
+            best = 0
+    order = [best] + [i for i in range(len(tracks)) if i != best]
+    failure = DecodeError("This file has no playable sound in it.")
+    for position in order:
+        try:
+            data, rate = _decode_av_track(av, path, position)
+        except DecodeError as e:
+            failure = e
+            continue
+        except Exception as e:
+            log.info("FFmpeg track %d of %s failed: %s", position, path.name, e)
+            continue
+        if data.size and float(np.max(np.abs(data))) >= SILENCE_PEAK:
+            return data, rate
+        failure = DecodeError("This file is silent (or nearly silent).")
+    raise failure
+
+
+def _decode_av_track(av, path: Path, position: int) -> Tuple[np.ndarray, int]:
+    """Decode one track, skipping damaged packets and following format changes mid-stream."""
+    with av.open(str(path)) as container:
+        stream = container.streams.audio[position]
         rate = int(stream.codec_context.sample_rate or stream.rate or 48000)
-        # packed float stereo: to_ndarray() is interleaved L R L R ...
-        resampler = av.AudioResampler(format="flt", layout="stereo", rate=rate)
         limit = MAX_SECONDS * rate * 2
-        chunks, total = [], 0
-        for frame in container.decode(stream):
-            frame.pts = None
-            for out in _frames(resampler.resample(frame)):
-                chunk = out.to_ndarray().reshape(-1)
+        chunks, total, bad = [], 0, 0
+        resampler, key = None, None
+
+        def collect(result):
+            nonlocal total
+            for out in _frames(result):
+                chunk = out.to_ndarray().reshape(-1)       # packed stereo float: L R L R ...
                 chunks.append(chunk)
                 total += chunk.shape[0]
-            if total >= limit:
-                break
+
         try:
-            for out in _frames(resampler.resample(None)):
-                chunks.append(out.to_ndarray().reshape(-1))
-        except Exception:
-            pass
+            for packet in container.demux(stream):
+                try:
+                    frames = packet.decode()
+                except av.error.FFmpegError:
+                    bad += 1                               # one damaged packet: skip it
+                    continue
+                for frame in frames:
+                    frame_key = (frame.format.name, frame.layout.name, frame.sample_rate)
+                    if frame_key != key:                   # channel count / rate changed
+                        if resampler is not None:
+                            collect(_flush(resampler))
+                        resampler = av.AudioResampler(format="flt", layout="stereo", rate=rate)
+                        key = frame_key
+                    frame.pts = None
+                    collect(resampler.resample(frame))
+                if total >= limit:
+                    break
+        except av.error.FFmpegError as e:                  # truncated file: keep what we have
+            log.info("FFmpeg stopped early on %s: %s", path.name, e)
+        if resampler is not None:
+            collect(_flush(resampler))
+    if bad:
+        log.info("Skipped %d damaged packets in %s", bad, path.name)
     if not chunks:
-        raise DecodeError("This file has no sound in it.")
+        raise DecodeError("This file has no playable sound in it.")
     data = np.concatenate(chunks)[:limit]
     return data[:data.shape[0] // 2 * 2].reshape(-1, 2), rate
+
+
+def _flush(resampler):
+    try:
+        return resampler.resample(None)
+    except Exception:
+        return []
 
 
 def _frames(result):
@@ -165,7 +226,11 @@ def import_to_library(src, library: Path, data: Optional[np.ndarray] = None, rat
         if size > MAX_COPY_BYTES:
             if data is None or not rate:
                 return src
-            return _save_flac(library, src.stem, data, rate)
+            try:
+                return _save_flac(library, src.stem, data, rate)
+            except Exception as e:                      # disk full, file locked ...
+                log.warning("Could not store %s as FLAC: %s", src.name, e)
+                return src
         target = library / src.name
         n = 2
         while target.exists():
@@ -173,7 +238,7 @@ def import_to_library(src, library: Path, data: Optional[np.ndarray] = None, rat
                 return target
             target = library / f"{src.stem} ({n}){src.suffix}"
             n += 1
-        part = target.with_name(target.name + ".part")    # a killed copy never looks finished
+        part = target.with_name(target.name + TMP_SUFFIX)    # a killed copy never looks finished
         shutil.copy2(src, part)
         os.replace(part, target)
         return target
@@ -188,17 +253,30 @@ def _save_flac(library: Path, stem: str, data: np.ndarray, rate: int) -> Path:
     target = library / f"{stem}.flac"
     n = 2
     while target.exists():
+        try:
+            info = sf.info(str(target))
+            if info.frames == data.shape[0] and info.samplerate == rate:
+                return target                          # same video assigned again
+        except Exception:
+            pass
         target = library / f"{stem} ({n}).flac"
         n += 1
-    part = target.with_name(target.name + ".part")
-    sf.write(str(part), np.clip(data, -1.0, 1.0), rate, format="FLAC", subtype="PCM_24")
-    os.replace(part, target)
+    part = target.with_name(target.name + TMP_SUFFIX)
+    try:
+        sf.write(str(part), np.clip(data, -1.0, 1.0), rate, format="FLAC", subtype="PCM_24")
+        os.replace(part, target)
+    except Exception:
+        try:
+            part.unlink()
+        except OSError:
+            pass
+        raise
     return target
 
 
 def clean_library(library: Path) -> None:
     """Remove half-written copies left by a crash or a kill during import."""
-    for leftover in library.glob("*.part"):
+    for leftover in library.glob("*" + TMP_SUFFIX):
         try:
             leftover.unlink()
         except OSError:

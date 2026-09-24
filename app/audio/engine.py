@@ -611,9 +611,13 @@ class AudioEngine(QObject):
                 return                      # replaced before it started
             try:
                 data, rate = decode_file(path)
+                if token != self._tokens[pad]:
+                    return                  # the user picked something else meanwhile
                 sound = PadSound(data, rate, str(path))
                 for bus in self._buses:
                     sound.at_rate(bus.samplerate)
+                if token != self._tokens[pad]:
+                    return
                 stored = Path(path)
                 if import_fn is not None:
                     stored = import_fn(stored, data, rate)

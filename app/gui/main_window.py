@@ -8,14 +8,14 @@ import math
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QEvent, QObject, Qt, QTimer
+from PySide6.QtCore import QByteArray, QEvent, QFileInfo, QObject, Qt, QTimer
 from PySide6.QtGui import QActionGroup, QColor, QGuiApplication, QPainter
 from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QHBoxLayout, QInputDialog,
                                QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QPushButton,
                                QSlider, QToolButton, QVBoxLayout, QWidget, QWidgetAction)
 
 from app import paths
-from app.audio.decode import FILE_FILTER, clean_library, import_to_library
+from app.audio.decode import FILE_FILTER, MISSING, clean_library, import_to_library
 from app.gui import theme
 from app.gui.widgets.device import DeviceWidget
 from app.midi.bindings import Binding, MidiEvent, NUM_PADS
@@ -232,7 +232,7 @@ class MainWindow(QMainWindow):
             pad.released.connect(lambda i: self.engine.release_pad(i))
             pad.add_requested.connect(self.choose_file)
             pad.menu_requested.connect(self._pad_menu)
-            pad.file_dropped.connect(self.assign_file)
+            pad.files_dropped.connect(self._on_files_dropped)
         for i, slider in enumerate(d.sliders):
             slider.value_changed.connect(lambda v, i=i: self._apply_slider(i, v))
             slider.learn_requested.connect(lambda i=i: self.start_learning([("slider", i)]))
@@ -413,6 +413,28 @@ class MainWindow(QMainWindow):
             self._last_dir = str(Path(path).parent)
             self.assign_file(i, path)
 
+    def _on_files_dropped(self, i: int, dropped: list, web: bool) -> None:
+        """First file on this pad, any others on the next empty pads."""
+        files = []
+        for path in dropped:
+            info = QFileInfo(path)
+            if info.isShortcut() or info.isSymLink():
+                path = info.symLinkTarget() or path          # Windows .lnk shortcuts
+            if Path(path).is_file():
+                files.append(path)
+        if not files:
+            self.statusBar().showMessage(
+                "Save the file to your computer first, then drop it here." if web
+                else "Drop sound or video files here (folders can't go on a pad).", 8000)
+            return
+        empty = [j for j in list(range(i + 1, NUM_PADS)) + list(range(i))
+                 if self.engine.sounds[j] is None and j not in self._assigning and not self.config.pad(j)["file"]]
+        targets = [i] + empty
+        for pad, path in zip(targets, files):
+            self.assign_file(pad, path)
+        if len(files) > len(targets):
+            self.statusBar().showMessage(f"Used {len(targets)} of {len(files)} files: no more empty pads.", 8000)
+
     def assign_file(self, i: int, path: str) -> None:
         if not Path(path).is_file():
             QMessageBox.warning(self, "Can't use this", "Please choose a file (not a folder).")
@@ -447,13 +469,17 @@ class MainWindow(QMainWindow):
             previous = self.engine.sounds[i]
             if previous is not None:
                 pad.set_sound(pad_cfg["name"] or Path(previous.path).stem)
+            elif pad_cfg["file"]:
+                pad.set_error(f"Can't play “{pad_cfg['name'] or Path(pad_cfg['file']).stem}”\n"
+                              "Click to choose again")
             else:
                 pad.set_sound("")
             QMessageBox.warning(self, "Can't use this file", f"<b>{Path(requested).name}</b><br><br>{info}")
         else:
             name = pad_cfg["name"] or Path(requested).stem
-            pad.set_error(f"Can't find “{name}”\nClick to choose again")
-            self.statusBar().showMessage(f"Pad {i + 1}: {info}", 10000)
+            verb = "find" if info == MISSING else "play"
+            pad.set_error(f"Can't {verb} “{name}”\nClick to choose again")
+            self.statusBar().showMessage(f"Pad {i + 1} ({name}): {info}", 10000)
 
     def _pad_menu(self, i: int, pos) -> None:
         pad_cfg = self.config.pad(i)

@@ -236,3 +236,33 @@ def test_moved_app_folder_finds_library_copies(qtbot, tmp_path, monkeypatch, wav
     qtbot.waitUntil(lambda: w.device.pads[3].name == "horn", timeout=5000)
     assert Path(config.pad(3)["file"]) == copy
     w.shutdown()
+
+
+def test_dropping_several_files_fills_empty_pads(window, qtbot, wav):
+    load(window, qtbot, 1, wav(name="existing.wav"))
+    files = [str(wav(name=f"drop{k}.wav")) for k in range(3)]
+    with qtbot.waitSignals([window.engine.pad_loaded] * 3, timeout=8000):
+        window._on_files_dropped(0, files, False)
+    names = [window.config.pad(i)["name"] for i in range(4)]
+    assert names == ["drop0", "existing", "drop1", "drop2"]
+
+
+def test_dropping_a_web_link_explains(window):
+    window._on_files_dropped(0, [], True)
+    assert "Save the file" in window.statusBar().currentMessage()
+
+
+def test_unplayable_saved_file_says_cant_play(qtbot, tmp_path, monkeypatch):
+    monkeypatch.setenv("PANDAMINI_DATA_DIR", str(tmp_path / "data"))
+    junk = tmp_path / "junk.mp3"
+    junk.write_bytes(b"not audio" * 100)
+    config = Config(tmp_path / "config.json")
+    config.pad(0)["file"], config.pad(0)["name"] = str(junk), "junk"
+    engine = AudioEngine()
+    monkeypatch.setattr(engine, "set_outputs", lambda hp, mic: {})
+    w = MainWindow(config, engine, MidiListener(engine, backend=FakeBackend(names=[])))
+    qtbot.addWidget(w)
+    w.start()
+    qtbot.waitUntil(lambda: bool(w.device.pads[0].error), timeout=5000)
+    assert "Can't play" in w.device.pads[0].error
+    w.shutdown()
