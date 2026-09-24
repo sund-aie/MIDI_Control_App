@@ -1,16 +1,15 @@
-# PandaMINI Core Engine - Requirements
-# Production dependencies for the application
+# Panda MINI Soundboard — runtime dependencies (Python 3.9+)
 
-# Core GUI Framework
-PySide6>=6.6.0
+# GUI
+PySide6>=6.6
 
-# Audio Processing
-sounddevice>=0.4.6
-numpy>=1.24.0
-soundfile>=0.12.1
+# Audio output and decoding
+sounddevice>=0.4.6        # PortAudio (bundled in the Windows wheel)
+soundfile>=0.12.1         # WAV/FLAC/OGG/MP3/AIFF (libsndfile 1.1+ has MP3)
+numpy>=1.24
+av>=12.0                  # FFmpeg: M4A, AAC, WMA, OPUS, MP4/MOV/MKV/WEBM video ...
+soxr>=0.3                 # high-quality sample-rate conversion
 
-# MIDI Support
-mido>=1.3.0
-
-# Optional: For frozen executable builds
-# pyinstaller>=6.0.0
+# MIDI (Windows uses the built-in WinMM API, nothing extra needed)
+mido>=1.3; sys_platform != "win32"
+python-rtmidi>=1.5; sys_platform != "win32"
