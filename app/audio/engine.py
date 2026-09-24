@@ -596,11 +596,11 @@ class AudioEngine(QObject):
     # ── loading sounds ──────────────────────────────────────────
 
     def load_pad(self, pad: int, path: str,
-                 import_fn: Optional[Callable[[Path], Path]] = None) -> None:
+                 import_fn: Optional[Callable[[Path, np.ndarray, int], Path]] = None) -> None:
         """Decode `path` on the worker thread, then put it on the pad.
 
-        import_fn (optional) runs on the worker after a successful decode and
-        returns the path to remember (e.g. a copy in the sound library).
+        import_fn(path, frames, rate) (optional) runs on the worker after a successful
+        decode and returns the path to remember (e.g. a copy in the sound library).
         Emits pad_loaded(pad, ok, stored path or error message, requested path).
         """
         self._tokens[pad] += 1
@@ -616,7 +616,7 @@ class AudioEngine(QObject):
                     sound.at_rate(bus.samplerate)
                 stored = Path(path)
                 if import_fn is not None:
-                    stored = import_fn(stored)
+                    stored = import_fn(stored, data, rate)
                 sound.path = str(stored)
                 self._load_done.emit(pad, token, sound, "", str(path))
             except DecodeError as e:

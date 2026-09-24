@@ -7,6 +7,7 @@ migrated automatically.
 import json
 import logging
 import os
+import shutil
 from pathlib import Path
 from typing import Any, Optional
 
@@ -33,7 +34,7 @@ def default_config() -> dict:
         "version": VERSION,
         "audio": {"headphones_output": None, "mic_output": None},
         "levels": {"headphones": 0.8, "mic": 0.8, "keys": 0.6, "master": 1.0},
-        "midi": {"input_device": None, "matched": False},
+        "midi": {"input_device": None, "matched": False, "hint_dismissed": False},
         "pads": [_default_pad(i) for i in range(NUM_PADS)],
         "controls": {
             "sliders": [b.to_dict() if b else None for b in DEFAULT_SLIDERS],
@@ -80,46 +81,74 @@ class Config(QObject):
         self._timer.start()
 
     def save_now(self) -> None:
+        """Write to a temp file, flush it to disk, keep the previous file as .bak, then swap."""
         self._timer.stop()
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_suffix(".tmp")
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(self.data, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            if self.path.is_file():
+                try:
+                    shutil.copyfile(self.path, self._backup_path)
+                except OSError:
+                    pass
             os.replace(tmp, self.path)
         except OSError as e:
             log.error("Could not save settings to %s: %s", self.path, e)
 
+    @property
+    def _backup_path(self) -> Path:
+        return self.path.with_name(self.path.stem + ".bak.json")
+
     # ── loading ─────────────────────────────────────────────────
 
     def _load(self) -> dict:
-        raw = self._read(self.path)
+        raw = self._read(self.path, keep_aside=True)
+        if raw is None:
+            raw = self._read(self._backup_path)
+            if raw is not None:
+                log.warning("Using the backup settings file %s", self._backup_path)
         if raw is None:
             for legacy in paths.legacy_config_paths():
-                raw = self._read(legacy)
+                raw = self._read(legacy)             # never modified: it belongs to the old version
                 if raw is not None:
                     log.info("Importing settings from %s", legacy)
                     break
         if raw is None:
             return default_config()
-        if raw.get("version") != VERSION:
-            raw = migrate_v1(raw)
-        return sanitize(raw)
+        try:
+            version = raw.get("version")
+            if version is None or version == 1:
+                raw = migrate_v1(raw)
+            elif version != VERSION:
+                log.warning("Settings were written by a newer version (%s); keeping a copy", version)
+                shutil.copyfile(self.path, self.path.with_name(f"config.v{version}.bak.json"))
+            return sanitize(raw)
+        except Exception:
+            log.exception("Settings could not be understood; starting fresh")
+            return default_config()
 
-    def _read(self, path: Path) -> Optional[dict]:
+    def _read(self, path: Path, keep_aside: bool = False) -> Optional[dict]:
         if not path.is_file():
             return None
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8-sig") as f:   # tolerate a BOM (Notepad)
                 raw = json.load(f)
-            return raw if isinstance(raw, dict) else None
-        except (OSError, ValueError) as e:
-            log.error("Settings file %s is unreadable (%s); starting fresh", path, e)
-            try:
-                os.replace(path, path.with_suffix(".broken.json"))
-            except OSError:
-                pass
+        except ValueError as e:
+            log.error("Settings file %s is unreadable (%s)", path, e)
+            if keep_aside:
+                try:
+                    shutil.copyfile(path, path.with_name(path.stem + ".broken.json"))
+                except OSError:
+                    pass
             return None
+        except OSError as e:
+            log.error("Settings file %s could not be opened (%s)", path, e)
+            return None
+        return raw if isinstance(raw, dict) else None
 
 
 def migrate_v1(old: dict) -> dict:
@@ -147,7 +176,7 @@ def migrate_v1(old: dict) -> dict:
                 pad["name"] = Path(samples[i]).stem
             if i < len(volumes):
                 pad["volume"] = volumes[i]
-            if i < len(modes):
+            if i < len(modes) and isinstance(modes[i], str):
                 pad["mode"] = {"gate": "hold"}.get(modes[i], modes[i])
             if i < len(route_mic):
                 pad["to_mic"] = route_mic[i]
@@ -177,6 +206,7 @@ def sanitize(raw: dict) -> dict:
     device = midi.get("input_device")
     cfg["midi"]["input_device"] = device if isinstance(device, str) and device else None
     cfg["midi"]["matched"] = midi.get("matched") is True
+    cfg["midi"]["hint_dismissed"] = midi.get("hint_dismissed") is True
 
     pads = raw.get("pads")
     if isinstance(pads, list):
@@ -219,7 +249,7 @@ def sanitize(raw: dict) -> dict:
 def _unit(value: Any, default: float) -> float:
     try:
         v = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
     if v != v:  # NaN
         return default

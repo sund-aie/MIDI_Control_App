@@ -99,3 +99,24 @@ def test_import_to_library_copies_once(tmp_path, wav):
     other = wav(name="horn.wav", amp=0.3)                      # same name, new content
     second = import_to_library(other, library)
     assert second != first and second.name == "horn (2).wav"
+
+
+def test_big_files_are_stored_as_flac_of_the_decoded_sound(tmp_path, wav, monkeypatch):
+    import soundfile as sf
+    monkeypatch.setattr("app.audio.decode.MAX_COPY_BYTES", 1000)
+    library = tmp_path / "library"
+    library.mkdir()
+    src = wav(seconds=1, name="movie.wav")
+    data, rate = decode_file(src)
+    stored = import_to_library(src, library, data, rate)
+    assert stored.parent == library and stored.suffix == ".flac"
+    back, back_rate = sf.read(str(stored), dtype="float32")
+    assert back_rate == rate and back.shape == data.shape
+
+
+def test_half_written_copies_are_cleaned(tmp_path):
+    from app.audio.decode import clean_library
+    (tmp_path / "clip.mp4.part").write_bytes(b"x")
+    (tmp_path / "keep.wav").write_bytes(b"x")
+    clean_library(tmp_path)
+    assert [p.name for p in tmp_path.iterdir()] == ["keep.wav"]

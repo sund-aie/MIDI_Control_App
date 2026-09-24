@@ -74,3 +74,54 @@ def test_sanitize_fixes_bad_values():
 
 def test_default_map_matches_defaults():
     assert isinstance(ControlMap.defaults(), ControlMap)
+
+
+def test_bom_file_is_read_not_reset(tmp_path, qapp):
+    path = tmp_path / "config.json"
+    cfg = Config(path)
+    cfg.pad(2)["name"] = "Kept"
+    cfg.save_now()
+    path.write_bytes(b"\xef\xbb\xbf" + path.read_bytes())       # saved by Notepad "UTF-8 with BOM"
+    assert Config(path).pad(2)["name"] == "Kept"
+
+
+def test_corrupt_file_falls_back_to_backup(tmp_path, qapp):
+    path = tmp_path / "config.json"
+    cfg = Config(path)
+    cfg.pad(0)["name"] = "First"
+    cfg.save_now()
+    cfg.pad(0)["name"] = "Second"
+    cfg.save_now()                                               # previous file -> config.bak.json
+    path.write_text("{ truncated", encoding="utf-8")
+    assert Config(path).pad(0)["name"] == "First"
+    assert (tmp_path / "config.broken.json").exists()
+
+
+def test_legacy_file_is_never_modified(tmp_path, qapp, monkeypatch):
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text("{ broken", encoding="utf-8")
+    monkeypatch.setattr("app.paths.legacy_config_paths", lambda: [legacy])
+    Config(tmp_path / "config.json")
+    assert legacy.read_text(encoding="utf-8") == "{ broken"
+    assert not (tmp_path / "legacy.broken.json").exists()
+
+
+def test_newer_version_is_backed_up_not_wiped(tmp_path, qapp):
+    path = tmp_path / "config.json"
+    raw = default_config()
+    raw["version"] = 3
+    raw["pads"][1]["name"] = "Future"
+    raw["pads"][1]["file"] = "x.wav"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    cfg = Config(path)
+    assert cfg.pad(1)["name"] == "Future"
+    assert (tmp_path / "config.v3.bak.json").exists()
+
+
+def test_absurd_values_do_not_stop_startup(tmp_path, qapp):
+    path = tmp_path / "config.json"
+    path.write_text('{"version": 2, "levels": {"mic": 1e400}, '
+                    '"pads": [{"volume": 1e999, "binding": {"type": "note", "number": 1e400}}]}',
+                    encoding="utf-8")
+    cfg = Config(path)
+    assert cfg.pad(0)["binding"] is None and cfg.data["levels"]["mic"] == 1.0

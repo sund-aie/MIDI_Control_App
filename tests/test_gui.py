@@ -202,3 +202,37 @@ def test_wheel_over_output_picker_does_not_switch_device(window):
                      Qt.NoModifier, Qt.NoScrollPhase, False)
     QApplication.sendEvent(window.hp_combo, ev)
     assert window.hp_combo.currentIndex() == before
+
+
+def test_picking_headphones_leaves_mic_auto_detect_alone(window):
+    window.hp_combo.addItem("Other device", "Other device")
+    window.hp_combo.setCurrentIndex(window.hp_combo.count() - 1)
+    window._on_output_picked("headphones_output", window.hp_combo)
+    audio = window.config.data["audio"]
+    assert audio["headphones_output"] == "Other device"
+    assert audio["mic_output"] is None                              # still "not chosen": VB-Cable auto-detect
+    window.mic_combo.setCurrentIndex(0)                             # "Off"
+    window._on_output_picked("mic_output", window.mic_combo)
+    assert audio["mic_output"] == ""
+
+
+def test_not_now_is_remembered(window):
+    window._dismiss_hint()
+    assert window.config.data["midi"]["hint_dismissed"] is True
+
+
+def test_moved_app_folder_finds_library_copies(qtbot, tmp_path, monkeypatch, wav):
+    monkeypatch.setenv("PANDAMINI_DATA_DIR", str(tmp_path / "data"))
+    copy = paths.library_dir() / "horn.wav"
+    copy.write_bytes(wav(name="horn.wav").read_bytes())
+    config = Config(tmp_path / "config.json")
+    config.pad(3)["file"] = str(tmp_path / "old place" / "user_data" / "sounds" / "horn.wav")
+    config.pad(3)["name"] = "horn"
+    engine = AudioEngine()
+    monkeypatch.setattr(engine, "set_outputs", lambda hp, mic: {})
+    w = MainWindow(config, engine, MidiListener(engine, backend=FakeBackend(names=[])))
+    qtbot.addWidget(w)
+    w.start()
+    qtbot.waitUntil(lambda: w.device.pads[3].name == "horn", timeout=5000)
+    assert Path(config.pad(3)["file"]) == copy
+    w.shutdown()

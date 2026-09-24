@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QHBoxLayout
                                QSlider, QToolButton, QVBoxLayout, QWidget, QWidgetAction)
 
 from app import paths
-from app.audio.decode import FILE_FILTER, import_to_library
+from app.audio.decode import FILE_FILTER, clean_library, import_to_library
 from app.gui import theme
 from app.gui.widgets.device import DeviceWidget
 from app.midi.bindings import Binding, MidiEvent, NUM_PADS
@@ -183,8 +183,8 @@ class MainWindow(QMainWindow):
         row.addStretch(1)
         for combo in (self.hp_combo, self.mic_combo):
             combo.setFocusPolicy(Qt.StrongFocus)
-        self.hp_combo.activated.connect(lambda _: self._on_output_picked())
-        self.mic_combo.activated.connect(lambda _: self._on_output_picked())
+        self.hp_combo.activated.connect(lambda _: self._on_output_picked("headphones_output", self.hp_combo))
+        self.mic_combo.activated.connect(lambda _: self._on_output_picked("mic_output", self.mic_combo))
         return row
 
     def _build_hint(self):
@@ -200,10 +200,15 @@ class MainWindow(QMainWindow):
         go.clicked.connect(self.start_setup)
         row.addWidget(go)
         later = QPushButton("Not now")
-        later.clicked.connect(self.hint.hide)
+        later.clicked.connect(self._dismiss_hint)
         row.addWidget(later)
         self.hint.hide()
         return self.hint
+
+    def _dismiss_hint(self) -> None:
+        self.hint.hide()
+        self.config.data["midi"]["hint_dismissed"] = True
+        self.config.changed()
 
     def _build_banner(self):
         self.banner = QWidget()
@@ -287,17 +292,23 @@ class MainWindow(QMainWindow):
         self._open_outputs()
 
         library = paths.library_dir()
+        clean_library(library)
         for i in range(NUM_PADS):
             self._apply_pad_settings(i)
             pad_cfg = self.config.pad(i)
             if pad_cfg["file"]:
+                path = Path(pad_cfg["file"])
+                if not path.is_file() and (library / path.name).is_file():
+                    pad_cfg["file"] = str(library / path.name)     # app folder was moved
+                    self.config.changed()
                 self.device.pads[i].set_loading()
                 # also pulls sounds from older versions (e.g. in Downloads) into the library
-                self.engine.load_pad(i, pad_cfg["file"], import_fn=lambda p: import_to_library(p, library))
+                self.engine.load_pad(i, pad_cfg["file"],
+                                     import_fn=lambda p, d, r: import_to_library(p, library, d, r))
 
         self.midi.set_control_map(self.config.control_map())
         self.midi.start(cfg["midi"]["input_device"])
-        self.hint.setVisible(not cfg["midi"]["matched"])
+        self.hint.setVisible(not cfg["midi"]["matched"] and not cfg["midi"]["hint_dismissed"])
         self._rebuild_midi_menu(self.midi.devices())
         self._tick.start()
         self._started = True
@@ -344,12 +355,15 @@ class MainWindow(QMainWindow):
             combo.setCurrentIndex(max(0, index))
             combo.blockSignals(False)
 
-    def _on_output_picked(self) -> None:
+    def _on_output_picked(self, key: str, combo: QComboBox) -> None:
+        """Save only the picker the user touched (so the mic stays 'not chosen' → VB-Cable auto-detect)."""
         audio = self.config.data["audio"]
-        picked = (self.hp_combo.currentData(), self.mic_combo.currentData() or "")
-        if picked == (audio["headphones_output"], audio["mic_output"] or ""):
+        value = combo.currentData()
+        if key == "mic_output":
+            value = value or ""          # "" = the user turned the Discord mic off on purpose
+        if audio[key] == value:
             return
-        audio["headphones_output"], audio["mic_output"] = picked
+        audio[key] = value
         self.config.changed()
         self._open_outputs()
 
@@ -407,7 +421,7 @@ class MainWindow(QMainWindow):
         self.device.pads[i].set_loading()
         self.statusBar().showMessage(f"Loading '{Path(path).name}' onto Pad {i + 1}…")
         library = paths.library_dir()
-        self.engine.load_pad(i, path, import_fn=lambda p: import_to_library(p, library))
+        self.engine.load_pad(i, path, import_fn=lambda p, d, r: import_to_library(p, library, d, r))
 
     def _on_pad_loaded(self, i: int, ok: bool, info: str, requested: str) -> None:
         pad_cfg = self.config.pad(i)

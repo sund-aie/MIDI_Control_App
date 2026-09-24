@@ -5,9 +5,10 @@ soundfile (libsndfile) handles WAV/FLAC/OGG/MP3/AIFF quickly; anything else
 (M4A, AAC, WMA, OPUS, MP4/MOV/MKV/WEBM video, ...) goes through PyAV/FFmpeg.
 """
 import logging
+import os
 import shutil
 from pathlib import Path
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -150,26 +151,58 @@ def resample(data: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
     return np.ascontiguousarray(out, dtype=np.float32)
 
 
-def import_to_library(src, library: Path) -> Path:
-    """Copy a sound into the app's own folder so moving/deleting the original is harmless."""
+def import_to_library(src, library: Path, data: Optional[np.ndarray] = None, rate: int = 0) -> Path:
+    """Keep a copy of a pad's sound in the app's own folder, so moving/deleting the original is harmless.
+
+    Normal files are copied as they are. Very big files (long videos) are stored as a FLAC of the
+    decoded sound instead, which is all the pad uses.
+    """
     src = Path(src)
     try:
         if src.resolve().parent == library.resolve():
             return src
-        if src.stat().st_size > MAX_COPY_BYTES:
-            return src
+        size = src.stat().st_size
+        if size > MAX_COPY_BYTES:
+            if data is None or not rate:
+                return src
+            return _save_flac(library, src.stem, data, rate)
         target = library / src.name
         n = 2
         while target.exists():
-            if target.stat().st_size == src.stat().st_size and _same_bytes(target, src):
+            if target.stat().st_size == size and _same_bytes(target, src):
                 return target
             target = library / f"{src.stem} ({n}){src.suffix}"
             n += 1
-        shutil.copy2(src, target)
+        part = target.with_name(target.name + ".part")    # a killed copy never looks finished
+        shutil.copy2(src, part)
+        os.replace(part, target)
         return target
     except OSError as e:
         log.warning("Could not copy %s into the sound library: %s", src, e)
         return src
+
+
+def _save_flac(library: Path, stem: str, data: np.ndarray, rate: int) -> Path:
+    import soundfile as sf
+
+    target = library / f"{stem}.flac"
+    n = 2
+    while target.exists():
+        target = library / f"{stem} ({n}).flac"
+        n += 1
+    part = target.with_name(target.name + ".part")
+    sf.write(str(part), np.clip(data, -1.0, 1.0), rate, format="FLAC", subtype="PCM_24")
+    os.replace(part, target)
+    return target
+
+
+def clean_library(library: Path) -> None:
+    """Remove half-written copies left by a crash or a kill during import."""
+    for leftover in library.glob("*.part"):
+        try:
+            leftover.unlink()
+        except OSError:
+            pass
 
 
 def _same_bytes(a: Path, b: Path, chunk: int = 1 << 20) -> bool:

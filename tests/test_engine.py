@@ -236,7 +236,7 @@ def test_async_load_emits_and_installs(engine, qtbot, wav, tmp_path):
     attach(engine, (ROLE_HEADPHONES, 48000))
     stored = tmp_path / "copied.wav"
 
-    def fake_import(p):
+    def fake_import(p, data, rate):
         stored.write_bytes(p.read_bytes())
         return stored
 

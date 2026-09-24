@@ -54,7 +54,7 @@ class Binding:
             number = int(d["number"])
             channel = d.get("channel")
             channel = None if channel is None else int(channel)
-        except (TypeError, KeyError, ValueError):
+        except (TypeError, KeyError, ValueError, OverflowError, AttributeError):
             return None
         if kind not in TYPES or not 0 <= number <= 127 or (channel is not None and not 0 <= channel <= 15):
             return None
