@@ -266,3 +266,13 @@ def test_unplayable_saved_file_says_cant_play(qtbot, tmp_path, monkeypatch):
     qtbot.waitUntil(lambda: bool(w.device.pads[0].error), timeout=5000)
     assert "Can't play" in w.device.pads[0].error
     w.shutdown()
+
+
+def test_drops_are_always_copies(window, qtbot):
+    from PySide6.QtCore import QMimeData, QPointF, QUrl
+    from PySide6.QtGui import QDropEvent
+    mime = QMimeData()
+    mime.setUrls([QUrl.fromLocalFile("/nonexistent/clip.wav")])
+    ev = QDropEvent(QPointF(10, 10), Qt.MoveAction | Qt.CopyAction, mime, Qt.LeftButton, Qt.ShiftModifier)
+    window.device.pads[0].dropEvent(ev)
+    assert ev.dropAction() == Qt.CopyAction

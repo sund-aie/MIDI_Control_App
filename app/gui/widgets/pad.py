@@ -116,9 +116,15 @@ class PadWidget(QWidget):
 
     def dragEnterEvent(self, e) -> None:
         if e.mimeData().hasUrls():
-            e.acceptProposedAction()
+            e.setDropAction(Qt.CopyAction)       # always a copy: Explorer must never delete the original
+            e.accept()
             self._drag_over = True
             self.update()
+
+    def dragMoveEvent(self, e) -> None:
+        if e.mimeData().hasUrls():
+            e.setDropAction(Qt.CopyAction)
+            e.accept()
 
     def dragLeaveEvent(self, e) -> None:
         self._drag_over = False
@@ -130,7 +136,8 @@ class PadWidget(QWidget):
         urls = e.mimeData().urls()
         local = [u.toLocalFile() for u in urls if u.isLocalFile()]
         web = any(not u.isLocalFile() for u in urls)
-        e.acceptProposedAction()
+        e.setDropAction(Qt.CopyAction)
+        e.accept()
         # Handle it after the drop returns: a dialog inside dropEvent would freeze Explorer.
         QTimer.singleShot(0, lambda: self.files_dropped.emit(self.index, local, web))
 

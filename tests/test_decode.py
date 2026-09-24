@@ -112,6 +112,12 @@ def test_big_files_are_stored_as_flac_of_the_decoded_sound(tmp_path, wav, monkey
     assert stored.parent == library and stored.suffix == ".flac"
     back, back_rate = sf.read(str(stored), dtype="float32")
     assert back_rate == rate and back.shape == data.shape
+    assert import_to_library(src, library, data, rate) == stored          # same file: reused
+    other_dir = tmp_path / "elsewhere"
+    other_dir.mkdir()
+    other = other_dir / "movie.wav"                                        # same name, different file
+    other.write_bytes(src.read_bytes() + b"\0" * 10)
+    assert import_to_library(other, library, data, rate) != stored
 
 
 def test_half_written_copies_are_cleaned(tmp_path):

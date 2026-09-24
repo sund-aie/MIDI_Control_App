@@ -4,6 +4,7 @@ Turn any sound or video file into float32 stereo frames.
 soundfile (libsndfile) handles WAV/FLAC/OGG/MP3/AIFF quickly; anything else
 (M4A, AAC, WMA, OPUS, MP4/MOV/MKV/WEBM video, ...) goes through PyAV/FFmpeg.
 """
+import hashlib
 import logging
 import os
 import shutil
@@ -226,8 +227,10 @@ def import_to_library(src, library: Path, data: Optional[np.ndarray] = None, rat
         if size > MAX_COPY_BYTES:
             if data is None or not rate:
                 return src
+            # named after the exact source file, so it's reused only for that same file
+            key = f"{src.resolve()}|{size}|{src.stat().st_mtime_ns}".encode("utf-8", "surrogatepass")
             try:
-                return _save_flac(library, src.stem, data, rate)
+                return _save_flac(library, f"{src.stem}-{hashlib.sha1(key).hexdigest()[:8]}", data, rate)
             except Exception as e:                      # disk full, file locked ...
                 log.warning("Could not store %s as FLAC: %s", src.name, e)
                 return src
@@ -247,20 +250,12 @@ def import_to_library(src, library: Path, data: Optional[np.ndarray] = None, rat
         return src
 
 
-def _save_flac(library: Path, stem: str, data: np.ndarray, rate: int) -> Path:
+def _save_flac(library: Path, name: str, data: np.ndarray, rate: int) -> Path:
     import soundfile as sf
 
-    target = library / f"{stem}.flac"
-    n = 2
-    while target.exists():
-        try:
-            info = sf.info(str(target))
-            if info.frames == data.shape[0] and info.samplerate == rate:
-                return target                          # same video assigned again
-        except Exception:
-            pass
-        target = library / f"{stem} ({n}).flac"
-        n += 1
+    target = library / f"{name}.flac"
+    if target.exists():
+        return target                                  # same video assigned again
     part = target.with_name(target.name + TMP_SUFFIX)
     try:
         sf.write(str(part), np.clip(data, -1.0, 1.0), rate, format="FLAC", subtype="PCM_24")
