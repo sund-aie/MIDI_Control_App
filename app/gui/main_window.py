@@ -528,7 +528,7 @@ class MainWindow(QMainWindow):
             self._last_unmatched = now
             self.statusBar().showMessage(
                 f"A pad sent {Binding.from_event(ev).describe()}, which isn't matched to any pad here. "
-                "Click “Set up pads” and hit each pad once.", 10000)
+                "Click “Set up controller” and hit each pad once.", 10000)
 
     def _on_tick(self) -> None:
         now = time.monotonic()
@@ -557,9 +557,11 @@ class MainWindow(QMainWindow):
             text, color = f"●  {message or 'No controller'}", theme.DANGER
         self.midi_button.setText(text)
         self.midi_button.setStyleSheet(f"QToolButton#midi {{ color: {color}; }}")
-        if ok:
-            self.config.data["midi"]["input_device"] = name
-            self.config.changed()
+
+    def _choose_midi(self, name) -> None:
+        self.config.data["midi"]["input_device"] = name     # None = automatic
+        self.config.changed()
+        self.midi.choose(name)
 
     def _rebuild_midi_menu(self, devices) -> None:
         menu = self.midi_menu
@@ -570,13 +572,13 @@ class MainWindow(QMainWindow):
         auto = menu.addAction("Automatic (find the Panda MINI)")
         auto.setCheckable(True)
         auto.setChecked(self.midi.wanted is None)
-        auto.triggered.connect(lambda: self.midi.choose(None))
+        auto.triggered.connect(lambda: self._choose_midi(None))
         group.addAction(auto)
         for name in devices:
             act = menu.addAction(name)
             act.setCheckable(True)
             act.setChecked(self.midi.wanted == name)
-            act.triggered.connect(lambda _=False, name=name: self.midi.choose(name))
+            act.triggered.connect(lambda _=False, name=name: self._choose_midi(name))
             group.addAction(act)
         if not devices:
             none = menu.addAction("(no MIDI devices found)")

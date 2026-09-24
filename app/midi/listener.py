@@ -8,6 +8,7 @@ other systems use mido + python-rtmidi.
 import logging
 import sys
 import threading
+import time
 from typing import Callable, List, Optional
 
 from PySide6.QtCore import QObject, QTimer, Signal
@@ -17,6 +18,7 @@ from app.midi.bindings import DRUM_CHANNEL, ControlMap, MidiEvent
 log = logging.getLogger(__name__)
 
 IS_WINDOWS = sys.platform == "win32"
+CC_REPEAT_WINDOW = 0.08  # seconds; closer CC values from a pad are one continuing hit
 PREFERRED_NAMES = ("panda", "worlde")   # in order: other WORLDE models share the prefix
 
 
@@ -65,11 +67,11 @@ class _WinMMBackend:
         names = []
         for i in range(self._winmm.midiInGetNumDevs()):
             caps = self._caps_type()
-            if self._winmm.midiInGetDevCapsW(i, self._ctypes.byref(caps), self._ctypes.sizeof(caps)) == 0:
-                names.append(caps.szPname)
+            ok = self._winmm.midiInGetDevCapsW(i, self._ctypes.byref(caps), self._ctypes.sizeof(caps)) == 0
+            names.append(caps.szPname if ok else f"MIDI input {i + 1}")  # position must equal device id
         return names
 
-    def open(self, index: int, on_bytes: Callable[[int, int, int], None]) -> None:
+    def open(self, index: int, name: str, on_bytes: Callable[[int, int, int], None]) -> None:
         from ctypes import wintypes
 
         def proc(handle, msg, instance, param1, param2):
@@ -105,9 +107,7 @@ class _MidoBackend:
     def list(self) -> List[str]:
         return list(self._mido.get_input_names())
 
-    def open(self, index: int, on_bytes: Callable[[int, int, int], None]) -> None:
-        name = self.list()[index]
-
+    def open(self, index: int, name: str, on_bytes: Callable[[int, int, int], None]) -> None:
         def callback(msg):
             data = msg.bytes()
             if data:
@@ -159,9 +159,11 @@ class MidiListener(QObject):
         self._engine = engine
         self._backend = backend if backend is not None else _make_backend()
         self._map = ControlMap.defaults()
-        self._cc_pad_down = set()
+        self._cc_pad_down = {}          # pad -> time of its last CC above zero
+        self._held_notes = set()        # synth notes switched on and not yet off
+        self._held_pads = set()
         self._lock = threading.Lock()
-        self.learning = False
+        self._learning = False
         self.wanted: Optional[str] = None       # name the user picked (or None = auto)
         self.connected: Optional[str] = None
         self._last_connected: Optional[str] = None   # reconnect to this after an unplug
@@ -179,6 +181,32 @@ class MidiListener(QObject):
     @property
     def control_map(self) -> ControlMap:
         return self._map
+
+    @property
+    def learning(self) -> bool:
+        return self._learning
+
+    @learning.setter
+    def learning(self, on: bool) -> None:
+        if on and not self._learning:
+            self.release_all()          # nothing may keep sounding while presses are captured
+        self._learning = bool(on)
+
+    def release_all(self) -> None:
+        """Send the note-offs / pad releases that would otherwise be lost (unplug, learning)."""
+        with self._lock:
+            notes, pads = list(self._held_notes), list(self._held_pads)
+            self._held_notes.clear()
+            self._held_pads.clear()
+            self._cc_pad_down.clear()
+        for note in notes:
+            if self._engine is not None:
+                self._engine.note_off(note)
+            self.key_off.emit(note)
+        for pad in pads:
+            if self._engine is not None:
+                self._engine.release_pad(pad)
+            self.pad_released.emit(pad)
 
     # ── connection ──────────────────────────────────────────────
 
@@ -213,6 +241,11 @@ class MidiListener(QObject):
             log.info("MIDI device %s disappeared", self.connected)
             self.disconnect()
             self._emit_status(False, "", "Controller unplugged. Plug it back in and it will reconnect.")
+        if (self.connected is not None and self.wanted is None and not _is_preferred(self.connected)
+                and any(_is_preferred(d) for d in devices)):
+            log.info("Panda MINI appeared; switching from %s", self.connected)
+            self.disconnect()
+            self._last_connected = None
         if self.connected is None:
             self._try_connect(devices)
 
@@ -231,7 +264,7 @@ class MidiListener(QObject):
             for i, name in enumerate(devices):
                 if preferred in name.lower():
                     return i
-        if self.wanted or self._last_connected:
+        if self.wanted or (self._last_connected and _is_preferred(self._last_connected)):
             return None
         return 0
 
@@ -249,7 +282,7 @@ class MidiListener(QObject):
             return
         name = devices[index]
         try:
-            self._backend.open(index, self._on_bytes)
+            self._backend.open(index, name, self._on_bytes)
         except MidiError as e:
             self._emit_status(False, name, str(e))
             return
@@ -265,7 +298,7 @@ class MidiListener(QObject):
         if self._backend is not None:
             self._backend.close()
         self.connected = None
-        self._cc_pad_down.clear()
+        self.release_all()
 
     def stop(self) -> None:
         self._poll.stop()
@@ -289,9 +322,8 @@ class MidiListener(QObject):
 
     def handle(self, ev: MidiEvent) -> None:
         self.activity.emit()
-        if self.learning:
-            if ev.is_press:
-                self.learn_event.emit(ev)
+        if self._learning and ev.is_press:
+            self.learn_event.emit(ev)   # releases still flow normally below
             return
 
         target = self._map.lookup(ev)
@@ -300,13 +332,19 @@ class MidiListener(QObject):
             self._handle_pad(target[1], ev)
             return
 
+        if ev.kind in ("note_on", "note_off") and ev.channel == DRUM_CHANNEL:
+            if ev.kind == "note_on":
+                self.unmatched_pad.emit(ev)   # a pad we don't know yet: hint, don't play the synth
+            return
         if ev.kind == "note_on":
-            if ev.channel == DRUM_CHANNEL:
-                self.unmatched_pad.emit(ev)
+            with self._lock:
+                self._held_notes.add(ev.number)
             if engine is not None:
                 engine.note_on(ev.number, ev.value)
             self.key_on.emit(ev.number, ev.value)
         elif ev.kind == "note_off":
+            with self._lock:
+                self._held_notes.discard(ev.number)
             if engine is not None:
                 engine.note_off(ev.number)
             self.key_off.emit(ev.number)
@@ -329,33 +367,45 @@ class MidiListener(QObject):
         elif ev.kind == "note_off":
             press = False
         elif ev.kind == "cc":
-            # Pads in CC mode send >0 on hit and 0 on release; ignore repeats while held.
+            # CC pads send >0 on a hit (maybe a stream of pressure values while held)
+            # and usually 0 on release. A value arriving after a pause is a new hit,
+            # so pads that never send the 0 keep working too.
+            now = time.monotonic()
             with self._lock:
                 if ev.value > 0:
-                    if pad in self._cc_pad_down:
+                    last = self._cc_pad_down.get(pad)
+                    self._cc_pad_down[pad] = now
+                    if last is not None and now - last < CC_REPEAT_WINDOW:
                         return
-                    self._cc_pad_down.add(pad)
                     press = True
                 else:
-                    self._cc_pad_down.discard(pad)
+                    self._cc_pad_down.pop(pad, None)
                     press = False
         elif ev.kind == "pc":
+            # A program change has no release: just start the sound.
             if engine is not None:
                 engine.trigger_pad(pad)
-                engine.release_pad(pad)
             self.pad_pressed.emit(pad)
             self.pad_released.emit(pad)
             return
         else:
             return
         if press:
+            with self._lock:
+                self._held_pads.add(pad)
             if engine is not None:
                 engine.trigger_pad(pad)
             self.pad_pressed.emit(pad)
         else:
+            with self._lock:
+                self._held_pads.discard(pad)
             if engine is not None:
                 engine.release_pad(pad)
             self.pad_released.emit(pad)
+
+
+def _is_preferred(name: str) -> bool:
+    return any(p in name.lower() for p in PREFERRED_NAMES)
 
 
 def parse(status: int, d1: int, d2: int) -> Optional[MidiEvent]:

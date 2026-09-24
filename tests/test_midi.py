@@ -29,7 +29,7 @@ class FakeBackend:
     def list(self):
         return list(self.names)
 
-    def open(self, index, on_bytes):
+    def open(self, index, name, on_bytes):
         if self.fail:
             raise self.fail
         self.opened = self.names[index]
@@ -90,6 +90,60 @@ def test_cc_mode_pads_trigger_once_per_hit(qapp):
     assert engine.calls == [("trigger", 0), ("release", 0), ("trigger", 0), ("release", 0)]
 
 
+def test_cc_pads_without_release_still_retrigger(qapp):
+    import time
+    engine = FakeEngine()
+    listener = MidiListener(engine, backend=FakeBackend())
+    listener.set_control_map(ControlMap([Binding("cc", 0, 20)] + [None] * 7, [None] * 4, [None] * 4))
+    listener.handle(MidiEvent("cc", 0, 20, 127))
+    time.sleep(0.1)
+    listener.handle(MidiEvent("cc", 0, 20, 127))
+    assert engine.calls == [("trigger", 0), ("trigger", 0)]
+
+
+def test_unmatched_drum_hit_does_not_play_synth(qapp):
+    engine = FakeEngine()
+    listener = MidiListener(engine, backend=FakeBackend())
+    listener.handle(MidiEvent("note_on", 9, 50, 100))
+    listener.handle(MidiEvent("note_off", 9, 50, 0))
+    assert engine.calls == []
+
+
+def test_program_change_pad_is_not_released_instantly(qapp):
+    engine = FakeEngine()
+    listener = MidiListener(engine, backend=FakeBackend())
+    listener.set_control_map(ControlMap([Binding("pc", 0, 3)] + [None] * 7, [None] * 4, [None] * 4))
+    listener.handle(MidiEvent("pc", 0, 3, 0))
+    assert engine.calls == [("trigger", 0)]
+
+
+def test_held_notes_are_released_when_learning_starts_or_unplugged(qapp):
+    engine = FakeEngine()
+    backend = FakeBackend(names=["WORLDE Panda MINI"])
+    listener = MidiListener(engine, backend=backend)
+    listener.start(None)
+    listener.handle(MidiEvent("note_on", 0, 60, 100))
+    listener.learning = True
+    assert ("note_off", 60) in engine.calls
+    listener.learning = False
+    listener.handle(MidiEvent("note_on", 9, 36, 100))           # default Pad 1, held
+    backend.names = []
+    listener.poll()
+    assert engine.calls[-1] == ("release", 0)
+    listener.stop()
+
+
+def test_automatic_mode_switches_to_panda_when_it_appears(qapp):
+    backend = FakeBackend(names=["loopMIDI Port"])
+    listener = MidiListener(FakeEngine(), backend=backend)
+    listener.start(None)
+    assert listener.connected == "loopMIDI Port"
+    backend.names = ["loopMIDI Port", "WORLDE Panda MINI"]
+    listener.poll()
+    assert listener.connected == "WORLDE Panda MINI"
+    listener.stop()
+
+
 def test_sliders_emit_normalised_values(qapp, qtbot):
     listener = MidiListener(FakeEngine(), backend=FakeBackend())
     with qtbot.waitSignal(listener.slider_moved) as blocker:
@@ -104,8 +158,7 @@ def test_learning_captures_instead_of_playing(qapp, qtbot):
     with qtbot.waitSignal(listener.learn_event) as blocker:
         listener.handle(MidiEvent("note_on", 9, 36, 100))
     assert blocker.args[0].number == 36
-    listener.handle(MidiEvent("note_off", 9, 36, 0))           # releases are not "hits"
-    assert engine.calls == []
+    assert engine.calls == []                                   # captured, not played
 
 
 def test_connects_to_panda_and_handles_unplug(qapp, qtbot):
