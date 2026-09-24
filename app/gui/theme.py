@@ -1,6 +1,6 @@
 """Colours, stylesheet and the app icon."""
 from PySide6.QtCore import QRectF, Qt
-from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
+from PySide6.QtGui import QColor, QIcon, QPainter, QPalette, QPixmap
 
 WINDOW = "#101114"
 BODY = "#17181b"
@@ -66,11 +66,35 @@ QMenu::item:disabled {{ color: {TEXT_FAINT}; }}
 QMenu::separator {{ height: 1px; background: {BUTTON_EDGE}; margin: 4px 8px; }}
 QStatusBar {{ background: #0c0d0f; color: {TEXT_DIM}; }}
 QStatusBar::item {{ border: none; }}
+QDialog, QMessageBox, QInputDialog, QFileDialog {{ background: {WINDOW}; }}
+QLineEdit {{
+    background: #1d1f24; color: {TEXT}; border: 1px solid {BUTTON_EDGE}; border-radius: 6px;
+    padding: 5px 8px; selection-background-color: #34507a;
+}}
+QLineEdit:focus {{ border-color: {LEARN}; }}
 QToolTip {{ background: #24262b; color: {TEXT}; border: 1px solid {BUTTON_EDGE}; padding: 4px; }}
 QSlider::groove:horizontal {{ height: 6px; background: #33353b; border-radius: 3px; }}
 QSlider::sub-page:horizontal {{ background: {ACCENT}; border-radius: 3px; }}
 QSlider::handle:horizontal {{ background: {TEXT}; width: 14px; margin: -5px 0; border-radius: 7px; }}
 """
+
+
+def apply(app) -> None:
+    """Dark Fusion palette + stylesheet, so dialogs stay readable in Windows light mode too."""
+    app.setStyle("Fusion")
+    pal = QPalette()
+    for role, color in (
+        (QPalette.Window, WINDOW), (QPalette.WindowText, TEXT), (QPalette.Base, "#1d1f24"),
+        (QPalette.AlternateBase, "#24262b"), (QPalette.Text, TEXT), (QPalette.Button, BUTTON),
+        (QPalette.ButtonText, TEXT), (QPalette.BrightText, "#ffffff"), (QPalette.Highlight, "#34507a"),
+        (QPalette.HighlightedText, "#ffffff"), (QPalette.ToolTipBase, "#24262b"),
+        (QPalette.ToolTipText, TEXT), (QPalette.PlaceholderText, TEXT_FAINT), (QPalette.Link, LEARN),
+    ):
+        pal.setColor(role, QColor(color))
+    for role in (QPalette.WindowText, QPalette.Text, QPalette.ButtonText):
+        pal.setColor(QPalette.Disabled, role, QColor(TEXT_FAINT))
+    app.setPalette(pal)
+    app.setStyleSheet(STYLESHEET)
 
 
 def app_icon() -> QIcon:

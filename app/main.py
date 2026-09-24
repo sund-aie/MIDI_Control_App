@@ -37,7 +37,6 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("Panda MINI Soundboard")
     app.setOrganizationName("PandaMINI")
-    app.setStyle("Fusion")
 
     # Imported after QApplication exists (widgets and the engine are QObjects).
     from app.audio.engine import AudioEngine
@@ -46,7 +45,7 @@ def main() -> int:
     from app.gui.main_window import MainWindow
     from app.midi.listener import MidiListener
 
-    app.setStyleSheet(theme.STYLESHEET)
+    theme.apply(app)
     app.setWindowIcon(theme.app_icon())
 
     config = Config()

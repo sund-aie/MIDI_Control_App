@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import QByteArray, QEvent, QObject, Qt, QTimer
-from PySide6.QtGui import QActionGroup, QColor, QPainter
+from PySide6.QtGui import QActionGroup, QColor, QGuiApplication, QPainter
 from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QHBoxLayout, QInputDialog,
                                QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QPushButton,
                                QSlider, QToolButton, QVBoxLayout, QWidget, QWidgetAction)
@@ -29,7 +29,9 @@ MODE_LABELS = (
     ("loop", "Loop (hit again to stop)"),
 )
 SLIDER_LEVELS = ("headphones", "mic", "keys", "master")
-SLIDER_CAPTIONS = ("HEADPHONES", "DISCORD MIC", "KEYS", "MASTER")
+SLIDER_CAPTIONS = ("HEADPHONES", "MIC", "KEYS", "MASTER")
+SLIDER_TIPS = ("volume of the pads in your headphones", "volume of the pads on the Discord mic",
+               "volume of the keyboard synth", "master volume")
 DISCORD_HELP = """<b>Play your pads into Discord (or OBS, Zoom, …)</b>
 <ol>
 <li>Install the free <a href="https://vb-audio.com/Cable/">VB-Audio Virtual Cable</a> and restart this app.</li>
@@ -42,6 +44,17 @@ DISCORD_HELP = """<b>Play your pads into Discord (or OBS, Zoom, …)</b>
     and choose <b>CABLE Input</b>.</li>
 </ol>
 Each pad's menu lets you choose whether it goes to your headphones, the Discord mic, or both."""
+
+
+def _short_status(message: str) -> str:
+    """Pill text for a controller problem; the full message goes to the tooltip/status bar."""
+    m = message.lower()
+    for key, short in (("another program", "Controller busy"), ("unplugged", "Controller unplugged"),
+                       ("waiting for", "Waiting for controller"), ("looking", "Looking for controller"),
+                       ("not available", "MIDI unavailable"), ("no controller", "No controller")):
+        if key in m:
+            return short
+    return "Controller problem" if message else "No controller"
 
 
 class LevelMeter(QWidget):
@@ -90,8 +103,8 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle("Panda MINI Soundboard")
         self.setWindowIcon(theme.app_icon())
-        self.setMinimumSize(980, 640)
-        self.resize(1280, 830)
+        self.setMinimumSize(900, 580)
+        self._restore_geometry()
 
         root = QWidget(objectName="root")
         layout = QVBoxLayout(root)
@@ -168,6 +181,8 @@ class MainWindow(QMainWindow):
         refresh.clicked.connect(lambda: self._reopen_outputs(rescan=True))
         row.addWidget(refresh)
         row.addStretch(1)
+        for combo in (self.hp_combo, self.mic_combo):
+            combo.setFocusPolicy(Qt.StrongFocus)
         self.hp_combo.activated.connect(lambda _: self._on_output_picked())
         self.mic_combo.activated.connect(lambda _: self._on_output_picked())
         return row
@@ -216,8 +231,7 @@ class MainWindow(QMainWindow):
         for i, slider in enumerate(d.sliders):
             slider.value_changed.connect(lambda v, i=i: self._apply_slider(i, v))
             slider.learn_requested.connect(lambda i=i: self.start_learning([("slider", i)]))
-            slider.setToolTip(f"Slider {i + 1}: {SLIDER_CAPTIONS[i].lower()} volume · "
-                              "right-click to match it to your controller")
+            slider.setToolTip(f"Slider {i + 1}: {SLIDER_TIPS[i]} · right-click to match it to your controller")
         for i, knob in enumerate(d.knobs):
             knob.learn_requested.connect(lambda i=i: self.start_learning([("knob", i)]))
         d.slider_captions = list(SLIDER_CAPTIONS)
@@ -246,12 +260,21 @@ class MainWindow(QMainWindow):
 
     # ── startup / shutdown ──────────────────────────────────────
 
+    def _restore_geometry(self) -> None:
+        """Saved size/position if it still fits a screen, else a size that fits this one."""
+        geometry = self.config.data["window"].get("geometry")
+        if geometry and self.restoreGeometry(QByteArray.fromBase64(geometry.encode())):
+            if any(scr.availableGeometry().intersects(self.frameGeometry()) for scr in QApplication.screens()):
+                return
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        avail = screen.availableGeometry()
+        w, h = min(1280, avail.width() - 40), min(830, avail.height() - 70)
+        self.resize(max(w, self.minimumWidth()), max(h, self.minimumHeight()))
+        self.move(avail.center() - self.rect().center())
+
     def start(self) -> None:
         """Apply settings, open audio outputs, load pad sounds, connect the controller."""
         cfg = self.config.data
-        geometry = cfg["window"].get("geometry")
-        if geometry:
-            self.restoreGeometry(QByteArray.fromBase64(geometry.encode()))
 
         self.engine.levels.update(cfg["levels"])
         for i, key in enumerate(SLIDER_LEVELS):
@@ -323,8 +346,10 @@ class MainWindow(QMainWindow):
 
     def _on_output_picked(self) -> None:
         audio = self.config.data["audio"]
-        audio["headphones_output"] = self.hp_combo.currentData()
-        audio["mic_output"] = self.mic_combo.currentData() or ""
+        picked = (self.hp_combo.currentData(), self.mic_combo.currentData() or "")
+        if picked == (audio["headphones_output"], audio["mic_output"] or ""):
+            return
+        audio["headphones_output"], audio["mic_output"] = picked
         self.config.changed()
         self._open_outputs()
 
@@ -452,6 +477,7 @@ class MainWindow(QMainWindow):
             menu.addSeparator()
             menu.addAction("Remove sound", lambda: self._remove_sound(i))
         menu.exec(pos)
+        menu.deleteLater()
 
     def _volume_action(self, menu: QMenu, i: int) -> QWidgetAction:
         box = QWidget()
@@ -575,11 +601,16 @@ class MainWindow(QMainWindow):
 
     def _set_midi_status(self, ok: bool, name: str, message: str) -> None:
         if ok:
-            text, color = f"●  {name} connected", theme.OK
+            text, color = f"●  {name}", theme.OK
         else:
-            text, color = f"●  {message or 'No controller'}", theme.DANGER
+            text, color = f"●  {_short_status(message)}", theme.DANGER
         self.midi_button.setText(text)
+        self.midi_button.setToolTip((message + "\n\n" if message else "") + "Click to choose which controller to use")
         self.midi_button.setStyleSheet(f"QToolButton#midi {{ color: {color}; }}")
+        if not ok and message:
+            self.statusBar().showMessage(message, 10000)
+        if self._learn is not None:
+            self._show_learn_step()
 
     def _choose_midi(self, name) -> None:
         self.config.data["midi"]["input_device"] = name     # None = automatic
@@ -591,7 +622,9 @@ class MainWindow(QMainWindow):
         menu.clear()
         head = menu.addAction("Listen to:")
         head.setEnabled(False)
-        group = QActionGroup(menu)
+        if getattr(self, "_midi_group", None) is not None:
+            self._midi_group.deleteLater()
+        group = self._midi_group = QActionGroup(menu)
         auto = menu.addAction("Automatic (find the Panda MINI)")
         auto.setCheckable(True)
         auto.setChecked(self.midi.wanted is None)
@@ -612,14 +645,13 @@ class MainWindow(QMainWindow):
     # ── learning (matching screen controls to the hardware) ─────
 
     def start_setup(self) -> None:
-        """Walk through every control: pads first, then sliders and knobs (each can be skipped)."""
-        self.hint.hide()
-        self.start_learning([("pad", i) for i in range(NUM_PADS)] +
-                            [("slider", i) for i in range(4)] + [("knob", i) for i in range(4)])
+        """Walk through the pads, then the sliders (each step can be skipped)."""
+        self.start_learning([("pad", i) for i in range(NUM_PADS)] + [("slider", i) for i in range(4)])
 
     def start_learning(self, targets) -> None:
         self.stop_learning(quiet=True)
-        self._learn = {"targets": list(targets), "pos": 0, "got": set()}
+        self.hint.hide()
+        self._learn = {"targets": list(targets), "pos": 0, "got": set(), "pads": 0}
         self.midi.learning = True
         self.skip_button.setVisible(len(targets) > 1)
         self.banner.show()
@@ -666,6 +698,8 @@ class MainWindow(QMainWindow):
         elif ev.kind != "cc":
             return              # sliders and knobs send CC messages
         learn["got"].add(binding)
+        if group == "pad":
+            learn["pads"] += 1
         cmap = self.midi.control_map.with_binding(group, i, binding)
         self.midi.set_control_map(cmap)
         self.config.set_control_map(cmap)
@@ -682,10 +716,10 @@ class MainWindow(QMainWindow):
         finished = learn["targets"][learn["pos"]]
         learn["pos"] += 1
         upcoming = learn["targets"][learn["pos"]] if learn["pos"] < len(learn["targets"]) else None
-        if finished == ("pad", NUM_PADS - 1) and len(learn["targets"]) > 1:
-            self.config.data["midi"]["matched"] = True   # all pads went through the walkthrough
+        if finished == ("pad", NUM_PADS - 1) and len(learn["targets"]) > 1 and learn["pads"]:
+            self.config.data["midi"]["matched"] = True   # the walkthrough really matched pads
             self.config.changed()
-            self.statusBar().showMessage("All 8 pads match your controller now.", 8000)
+            self.statusBar().showMessage(f"{learn['pads']} of 8 pads now match your controller.", 8000)
         if upcoming is None:
             self.stop_learning(quiet=True)
             if len(learn["targets"]) > 1:
@@ -704,7 +738,18 @@ class MainWindow(QMainWindow):
 
     # ── computer keyboard: 1-8 play pads, Esc stops ─────────────
 
+    def changeEvent(self, e) -> None:
+        if e.type() == QEvent.ActivationChange and not self.isActiveWindow():
+            for i in list(self._keys_held):         # key-ups go to the other app after Alt+Tab
+                self.device.pads[i].set_held(False)
+                self.engine.release_pad(i)
+            self._keys_held.clear()
+        super().changeEvent(e)
+
     def eventFilter(self, obj: QObject, e: QEvent) -> bool:
+        if e.type() == QEvent.Wheel and isinstance(obj, QComboBox) and not obj.view().isVisible():
+            e.ignore()
+            return True                              # scrolling past a picker must not switch devices
         if e.type() in (QEvent.KeyPress, QEvent.KeyRelease) and self.isActiveWindow():
             focus = QApplication.focusWidget()
             if isinstance(focus, QLineEdit) or QApplication.activeModalWidget() is not None \

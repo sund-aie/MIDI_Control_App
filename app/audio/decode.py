@@ -20,8 +20,10 @@ MAX_GAIN = 8.0                 # ... but never boosted more than +18 dB (hiss st
 SILENCE_PEAK = 1e-3            # quieter than -60 dBFS counts as "no usable sound"
 
 FILE_FILTER = (
-    "Sound or video files (*.wav *.mp3 *.ogg *.oga *.opus *.flac *.m4a *.aac *.wma "
-    "*.aif *.aiff *.aifc *.caf *.amr *.mp4 *.m4v *.mov *.mkv *.webm *.avi *.3gp *.flv);;"
+    "Sound or video files (*.wav *.mp3 *.ogg *.oga *.opus *.flac *.m4a *.m4b *.m4r *.aac *.wma "
+    "*.aif *.aiff *.aifc *.caf *.amr *.au *.snd *.mp2 *.ac3 *.eac3 *.dts *.wv *.ape *.mka "
+    "*.mp4 *.m4v *.mov *.mkv *.webm *.avi *.wmv *.asf *.flv *.3gp *.mpg *.mpeg *.ts *.mts "
+    "*.m2ts *.ogv *.vob);;"
     "All files (*)"
 )
 

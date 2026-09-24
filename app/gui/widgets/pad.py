@@ -5,7 +5,7 @@ from PySide6.QtWidgets import QWidget
 
 from app.gui import theme
 
-MODE_TAGS = {"toggle": "PLAY/STOP", "hold": "HOLD", "loop": "LOOP"}
+MODE_TAGS = {"toggle": "ON/OFF", "hold": "HOLD", "loop": "LOOP"}
 
 
 class PadWidget(QWidget):
@@ -205,24 +205,30 @@ class PadWidget(QWidget):
             tag_font = base * 0.075
             tag = MODE_TAGS.get(self.mode)
             if tag:
-                self._tag(p, QPointF(r.left() + pad_in * 0.8, r.top() + pad_in * 0.8), tag, tag_font)
-            off = []
-            if not self.to_headphones:
-                off.append("NOT IN HEADPHONES")
-            if not self.to_mic:
-                off.append("NOT ON MIC")
-            if off:
+                at = QPointF(r.left() + pad_in * 0.8, r.top() + pad_in * 0.8)
+                self._tag(p, at, tag, tag_font, self._menu_rect().left() - at.x() - 4)
+            if not self.to_headphones and not self.to_mic:
+                route = "MUTED"
+            elif not self.to_headphones:
+                route = "NO HEADPHONES"
+            elif not self.to_mic:
+                route = "NO MIC"
+            else:
+                route = ""
+            if route:
                 self._text(p, QRectF(r.left(), r.bottom() - base * 0.2, r.width(), base * 0.16),
-                           " · ".join(off), QColor(0, 0, 0, 150), base * 0.062, bold=True)
+                           route, QColor(150, 20, 20) if route == "MUTED" else QColor(0, 0, 0, 150),
+                           base * 0.07, bold=True)
 
         # options button
         if self.has_sound or self.error:
             m = self._menu_rect()
             hot = hover and m.contains(self.mapFromGlobal(self.cursor().pos()).toPointF())
-            p.setPen(Qt.NoPen)
-            p.setBrush(QColor(0, 0, 0, 60 if hot else 28))
+            p.setPen(QPen(QColor(0, 0, 0, 60), 1))
+            p.setBrush(QColor("#ffffff") if hot else QColor("#f4f4f4"))
             p.drawEllipse(m)
-            p.setBrush(QColor(0, 0, 0, 170))
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(0, 0, 0, 190))
             d = m.width() * 0.11
             for k in (-1, 0, 1):
                 p.drawEllipse(QPointF(m.center().x() + k * m.width() * 0.24, m.center().y()), d, d)
@@ -241,11 +247,13 @@ class PadWidget(QWidget):
         option.setWrapMode(QTextOption.NoWrap)
         p.drawText(rect, "\n".join(lines), option)
 
-    def _tag(self, p: QPainter, at: QPointF, text: str, px: float) -> None:
+    def _tag(self, p: QPainter, at: QPointF, text: str, px: float, max_w: float) -> None:
         font = QFont(self.font())
         font.setPixelSize(max(8, int(px)))
         font.setBold(True)
         metrics = QFontMetricsF(font)
+        if max_w < metrics.horizontalAdvance(text) + px * 0.9:
+            return                              # no room: never cover the options button
         w = metrics.horizontalAdvance(text) + px * 0.9
         rect = QRectF(at.x(), at.y(), w, metrics.height() + px * 0.2)
         p.setPen(Qt.NoPen)

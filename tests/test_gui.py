@@ -107,7 +107,7 @@ def test_setup_walkthrough_matches_pads_then_sliders(window):
     for cc in (70, 70, 71, 72, 73):                                     # slider 1 keeps sending while moving
         window.midi.handle(MidiEvent("cc", 0, cc, 64))
         QApplication.processEvents()
-    window.stop_learning()
+    assert window._learn is None                                         # walkthrough ended after the sliders
     cmap = window.midi.control_map
     assert [b.number for b in cmap.pads] == notes
     assert [b.number for b in cmap.sliders] == [70, 71, 72, 73]
@@ -163,3 +163,42 @@ def test_old_sound_paths_are_pulled_into_library(qtbot, tmp_path, monkeypatch, w
     qtbot.waitUntil(lambda: w.device.pads[0].name == "from downloads", timeout=5000)
     assert Path(config.pad(0)["file"]).parent == paths.library_dir()
     w.shutdown()
+
+
+def test_dialogs_use_dark_palette(qapp):
+    from PySide6.QtGui import QPalette
+    from app.gui import theme
+    theme.apply(qapp)
+    pal = qapp.palette()
+    assert pal.color(QPalette.Window).lightness() < 60
+    assert pal.color(QPalette.Base).lightness() < 60
+    assert pal.color(QPalette.Text).lightness() > 200
+
+
+def test_setup_with_nothing_matched_keeps_first_run_hint(window):
+    window.start_setup()
+    for _ in range(8):
+        window._learn_skip()
+    window.stop_learning()
+    assert window.config.data["midi"]["matched"] is False
+
+
+def test_losing_focus_releases_held_number_keys(window, qtbot, wav):
+    load(window, qtbot, 0, wav(seconds=2))
+    window._set_pad_option(0, "mode", "hold")
+    window._keys_held.add(0)
+    window.engine.trigger_pad(0)
+    window.changeEvent(QEvent(QEvent.ActivationChange))
+    if not window.isActiveWindow():
+        assert not window._keys_held and not window.engine.is_playing(0)
+
+
+def test_wheel_over_output_picker_does_not_switch_device(window):
+    from PySide6.QtCore import QPoint, QPointF
+    from PySide6.QtGui import QWheelEvent
+    window.hp_combo.addItem("Other device", "Other device")
+    before = window.hp_combo.currentIndex()
+    ev = QWheelEvent(QPointF(5, 5), QPointF(5, 5), QPoint(0, 0), QPoint(0, -120), Qt.NoButton,
+                     Qt.NoModifier, Qt.NoScrollPhase, False)
+    QApplication.sendEvent(window.hp_combo, ev)
+    assert window.hp_combo.currentIndex() == before

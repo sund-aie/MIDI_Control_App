@@ -17,7 +17,7 @@ Positions are in a fixed 1400×840 design space and scaled uniformly, so the
 proportions match the hardware at any window size.
 """
 from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtGui import QColor, QFont, QFontMetricsF, QPainter, QPen
 from PySide6.QtWidgets import QWidget
 
 from app.gui import theme
@@ -177,10 +177,12 @@ class DeviceWidget(QWidget):
             p.drawText(self.map_rect(QRectF(slot_x - 20, SLIDER_TOP + SLIDER_H + 2, 40, 22)), Qt.AlignCenter,
                        str(i + 1))
             if self.slider_captions[i]:
-                p.setFont(self._font(10.5, bold=True))
+                font = self._font(10.5, bold=True)
+                p.setFont(font)
                 p.setPen(QColor(theme.TEXT_DIM))
-                p.drawText(self.map_rect(QRectF(cx - 53, SLIDER_TOP + SLIDER_H + 25, 106, 16)), Qt.AlignCenter,
-                           self.slider_captions[i])
+                box = self.map_rect(QRectF(cx - 50, SLIDER_TOP + SLIDER_H + 25, 100, 16))
+                p.drawText(box, Qt.AlignCenter,
+                           QFontMetricsF(font).elidedText(self.slider_captions[i], Qt.ElideRight, box.width()))
 
         # model name between the panel and the keys
         p.setFont(self._font(17))
