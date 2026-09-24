@@ -211,7 +211,7 @@ class PadWidget(QWidget):
             if not self.to_headphones and not self.to_mic:
                 route = "MUTED"
             elif not self.to_headphones:
-                route = "NO HEADPHONES"
+                route = "NO PHONES"
             elif not self.to_mic:
                 route = "NO MIC"
             else:
