@@ -39,7 +39,10 @@ def setup_logging() -> None:
         "Unhandled error in thread %s", a.thread.name if a.thread else "?",
         exc_info=(a.exc_type, a.exc_value, a.exc_traceback))
     try:
-        _crash_file = open(paths.logs_dir() / "crash.log", "a", encoding="utf-8")
+        crash_log = paths.logs_dir() / "crash.log"
+        if crash_log.is_file() and crash_log.stat().st_size > 1_000_000:
+            crash_log.unlink()
+        _crash_file = open(crash_log, "a", encoding="utf-8")
         faulthandler.enable(_crash_file)
     except (OSError, RuntimeError):
         pass

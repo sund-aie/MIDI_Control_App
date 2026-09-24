@@ -106,30 +106,37 @@ class Config(QObject):
     # ── loading ─────────────────────────────────────────────────
 
     def _load(self) -> dict:
+        source = self.path
         raw = self._read(self.path, keep_aside=True)
         if raw is None:
-            raw = self._read(self._backup_path)
+            raw, source = self._read(self._backup_path), self._backup_path
             if raw is not None:
                 log.warning("Using the backup settings file %s", self._backup_path)
         if raw is None:
             for legacy in paths.legacy_config_paths():
-                raw = self._read(legacy)             # never modified: it belongs to the old version
+                raw, source = self._read(legacy), legacy   # never modified: it belongs to the old version
                 if raw is not None:
                     log.info("Importing settings from %s", legacy)
                     break
         if raw is None:
             return default_config()
+        version = raw.get("version")
+        if version not in (None, 1, VERSION):
+            log.warning("Settings were written by a newer version (%s); keeping a copy", version)
+            self._copy_aside(source, f"config.v{version}.bak.json")
         try:
-            version = raw.get("version")
-            if version is None or version == 1:
-                raw = migrate_v1(raw)
-            elif version != VERSION:
-                log.warning("Settings were written by a newer version (%s); keeping a copy", version)
-                shutil.copyfile(self.path, self.path.with_name(f"config.v{version}.bak.json"))
-            return sanitize(raw)
+            return sanitize(migrate_v1(raw) if version in (None, 1) else raw)
         except Exception:
             log.exception("Settings could not be understood; starting fresh")
+            if source == self.path:
+                self._copy_aside(source, "config.broken.json")
             return default_config()
+
+    def _copy_aside(self, source: Path, name: str) -> None:
+        try:
+            shutil.copyfile(source, self.path.with_name(name))
+        except OSError as e:
+            log.warning("Could not keep a copy of %s: %s", source, e)
 
     def _read(self, path: Path, keep_aside: bool = False) -> Optional[dict]:
         if not path.is_file():

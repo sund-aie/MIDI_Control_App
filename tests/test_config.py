@@ -125,3 +125,12 @@ def test_absurd_values_do_not_stop_startup(tmp_path, qapp):
                     encoding="utf-8")
     cfg = Config(path)
     assert cfg.pad(0)["binding"] is None and cfg.data["levels"]["mic"] == 1.0
+
+
+def test_newer_version_from_backup_is_kept(tmp_path, qapp):
+    path = tmp_path / "config.json"
+    raw = default_config()
+    raw["version"] = 3
+    raw["pads"][0]["name"] = "Future"
+    (tmp_path / "config.bak.json").write_text(json.dumps(raw), encoding="utf-8")   # main file missing
+    assert Config(path).pad(0)["name"] == "Future"
