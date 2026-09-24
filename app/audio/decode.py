@@ -1,0 +1,163 @@
+"""
+Turn any sound or video file into float32 stereo frames.
+
+soundfile (libsndfile) handles WAV/FLAC/OGG/MP3/AIFF quickly; anything else
+(M4A, AAC, WMA, OPUS, MP4/MOV/MKV/WEBM video, ...) goes through PyAV/FFmpeg.
+"""
+import logging
+import shutil
+from pathlib import Path
+from typing import Tuple
+
+import numpy as np
+
+log = logging.getLogger(__name__)
+
+MAX_SECONDS = 10 * 60          # longest sound a pad keeps (RAM guard)
+MAX_COPY_BYTES = 200 * 1024 ** 2  # bigger files are used in place, not copied
+PEAK_TARGET = 0.9              # every sound is normalised to this peak
+
+FILE_FILTER = (
+    "Sound or video files (*.wav *.mp3 *.ogg *.oga *.opus *.flac *.m4a *.aac *.wma "
+    "*.aif *.aiff *.aifc *.caf *.amr *.mp4 *.m4v *.mov *.mkv *.webm *.avi *.3gp *.flv);;"
+    "All files (*)"
+)
+
+
+class DecodeError(Exception):
+    """The file could not be turned into sound. The message is user-facing."""
+
+
+def decode_file(path) -> Tuple[np.ndarray, int]:
+    """Return (frames, samplerate): frames is float32, shape (n, 2), peak-normalised."""
+    path = Path(path)
+    if not path.is_file():
+        raise DecodeError("The file doesn't exist any more.")
+
+    try:
+        data, rate = _decode_soundfile(path)
+    except Exception as sf_error:
+        log.info("soundfile could not read %s (%s); trying FFmpeg", path.name, sf_error)
+        try:
+            data, rate = _decode_av(path)
+        except DecodeError:
+            raise
+        except ImportError:
+            raise DecodeError("This file type needs FFmpeg support (pip install av).")
+        except Exception as av_error:
+            log.warning("FFmpeg could not read %s: %s", path.name, av_error)
+            raise DecodeError("This file has no playable sound in it.") from av_error
+
+    return _finish(data, rate)
+
+
+def _decode_soundfile(path: Path) -> Tuple[np.ndarray, int]:
+    import soundfile as sf
+
+    with sf.SoundFile(str(path)) as f:
+        rate = int(f.samplerate)
+        limit = MAX_SECONDS * rate
+        frames = min(f.frames, limit) if f.frames > 0 else limit
+        data = f.read(frames, dtype="float32", always_2d=True)
+    return data, rate
+
+
+def _decode_av(path: Path) -> Tuple[np.ndarray, int]:
+    import av
+
+    with av.open(str(path)) as container:
+        if not container.streams.audio:
+            raise DecodeError("This file has no sound in it.")
+        stream = container.streams.audio[0]
+        rate = int(stream.codec_context.sample_rate or stream.rate or 48000)
+        resampler = av.AudioResampler(format="fltp", layout="stereo", rate=rate)
+        limit = MAX_SECONDS * rate
+        chunks, total = [], 0
+        for frame in container.decode(stream):
+            frame.pts = None
+            for out in _frames(resampler.resample(frame)):
+                chunk = out.to_ndarray()
+                chunks.append(chunk)
+                total += chunk.shape[-1]
+            if total >= limit:
+                break
+        try:
+            for out in _frames(resampler.resample(None)):
+                chunks.append(out.to_ndarray())
+        except Exception:
+            pass
+    if not chunks:
+        raise DecodeError("This file has no sound in it.")
+    data = np.concatenate([c.reshape(2, -1) for c in chunks], axis=1).T
+    return data[:limit], rate
+
+
+def _frames(result):
+    if result is None:
+        return []
+    return result if isinstance(result, list) else [result]
+
+
+def _finish(data: np.ndarray, rate: int) -> Tuple[np.ndarray, int]:
+    data = np.asarray(data, dtype=np.float32)
+    if data.ndim == 1:
+        data = data[:, None]
+    if data.shape[1] == 1:
+        data = np.repeat(data, 2, axis=1)
+    elif data.shape[1] > 2:
+        data = data[:, :2]
+    data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
+    if data.shape[0] == 0 or rate <= 0:
+        raise DecodeError("This file has no sound in it.")
+    peak = float(np.max(np.abs(data)))
+    if peak < 1e-6:
+        raise DecodeError("This file is silent.")
+    data *= PEAK_TARGET / peak
+    return np.ascontiguousarray(data, dtype=np.float32), int(rate)
+
+
+def resample(data: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
+    """Convert (n, 2) float32 frames between sample rates."""
+    if src_rate == dst_rate or data.shape[0] == 0:
+        return data
+    try:
+        import soxr
+        out = soxr.resample(data, src_rate, dst_rate, quality="HQ")
+    except ImportError:
+        n_out = max(1, int(round(data.shape[0] * dst_rate / src_rate)))
+        x_old = np.arange(data.shape[0], dtype=np.float64)
+        x_new = np.linspace(0, data.shape[0] - 1, n_out)
+        out = np.stack([np.interp(x_new, x_old, data[:, c]) for c in range(data.shape[1])], axis=1)
+    return np.ascontiguousarray(out, dtype=np.float32)
+
+
+def import_to_library(src, library: Path) -> Path:
+    """Copy a sound into the app's own folder so moving/deleting the original is harmless."""
+    src = Path(src)
+    try:
+        if src.resolve().parent == library.resolve():
+            return src
+        if src.stat().st_size > MAX_COPY_BYTES:
+            return src
+        target = library / src.name
+        n = 2
+        while target.exists():
+            if target.stat().st_size == src.stat().st_size and _same_bytes(target, src):
+                return target
+            target = library / f"{src.stem} ({n}){src.suffix}"
+            n += 1
+        shutil.copy2(src, target)
+        return target
+    except OSError as e:
+        log.warning("Could not copy %s into the sound library: %s", src, e)
+        return src
+
+
+def _same_bytes(a: Path, b: Path, chunk: int = 1 << 20) -> bool:
+    with open(a, "rb") as fa, open(b, "rb") as fb:
+        while True:
+            x, y = fa.read(chunk), fb.read(chunk)
+            if x != y:
+                return False
+            if not x:
+                return True

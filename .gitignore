@@ -29,7 +29,8 @@ build/
 coverage/
 htmlcov/
 
-# App Data
+# App data written when running from source (settings, imported sounds, logs)
+user_data/
 app/config.json
 
 # OS

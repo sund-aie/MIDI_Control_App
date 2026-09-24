@@ -1,66 +1,72 @@
 """
-PandaMINI Core Engine - Frozen-aware asset location paths
-Handles development directories and bundled %APPDATA%\\PandaMINI assets
+Where the app keeps its files.
+
+- User data (config, imported sounds, logs) lives in %APPDATA%\\PandaMINI when
+  running as a packaged .exe, and in <repo>/user_data when running from source.
+  Set PANDAMINI_DATA_DIR to override (used by the tests).
+- Read-only bundled resources are resolved relative to the PyInstaller bundle
+  (sys._MEIPASS) or the repository root.
 """
 import os
 import sys
 from pathlib import Path
 
+APP_DIR_NAME = "PandaMINI"
 
-def get_app_data_dir() -> Path:
-    """Get the application data directory based on platform and frozen state."""
-    if getattr(sys, 'frozen', False):
-        # Running as bundled executable
-        if sys.platform == 'win32':
-            app_data = Path(os.environ.get('APPDATA', '')) / 'PandaMINI'
-        elif sys.platform == 'darwin':
-            app_data = Path.home() / 'Library' / 'Application Support' / 'PandaMINI'
+
+def is_frozen() -> bool:
+    return bool(getattr(sys, "frozen", False))
+
+
+def repo_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def user_data_dir() -> Path:
+    override = os.environ.get("PANDAMINI_DATA_DIR")
+    if override:
+        base = Path(override)
+    elif is_frozen():
+        if sys.platform == "win32":
+            base = Path(os.environ.get("APPDATA") or Path.home()) / APP_DIR_NAME
+        elif sys.platform == "darwin":
+            base = Path.home() / "Library" / "Application Support" / APP_DIR_NAME
         else:
-            app_data = Path.home() / '.local' / 'share' / 'PandaMINI'
+            base = Path.home() / ".local" / "share" / APP_DIR_NAME
     else:
-        # Running in development mode
-        app_data = Path(__file__).parent.parent / 'assets'
-    
-    app_data.mkdir(parents=True, exist_ok=True)
-    return app_data
+        base = repo_root() / "user_data"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
 
 
-def get_samples_dir() -> Path:
-    """Get the samples directory for user-loaded audio files."""
-    samples_dir = get_app_data_dir() / 'samples'
-    samples_dir.mkdir(parents=True, exist_ok=True)
-    return samples_dir
+def config_path() -> Path:
+    return user_data_dir() / "config.json"
 
 
-def get_config_path() -> Path:
-    """Get the configuration file path."""
-    return get_app_data_dir() / 'config.json'
+def legacy_config_paths() -> list:
+    """Config files written by older versions of the app (migrated on first run)."""
+    if os.environ.get("PANDAMINI_DATA_DIR") or is_frozen():
+        return []
+    return [repo_root() / "assets" / "config.json"]
 
 
-def get_presets_dir() -> Path:
-    """Get the presets directory for saved synth patches."""
-    presets_dir = get_app_data_dir() / 'presets'
-    presets_dir.mkdir(parents=True, exist_ok=True)
-    return presets_dir
+def library_dir() -> Path:
+    """Folder holding copies of every sound the user put on a pad."""
+    path = user_data_dir() / "sounds"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
-def get_logs_dir() -> Path:
-    """Get the logs directory for application logs."""
-    logs_dir = get_app_data_dir() / 'logs'
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    return logs_dir
-
-
-def get_default_sample_path(sample_name: str) -> Path:
-    """Get the default path for a sample file."""
-    return get_samples_dir() / sample_name
+def logs_dir() -> Path:
+    path = user_data_dir() / "logs"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def resource_path(relative_path: str) -> Path:
-    """Get absolute path to resource, works for dev and for PyInstaller."""
-    if getattr(sys, 'frozen', False):
-        base_path = Path(sys.executable).parent
+    """Absolute path to a bundled read-only resource (dev and PyInstaller)."""
+    if is_frozen():
+        base = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
     else:
-        base_path = Path(__file__).parent.parent
-    
-    return base_path / relative_path
+        base = repo_root()
+    return base / relative_path

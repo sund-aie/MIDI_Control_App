@@ -1,623 +1,625 @@
 """
-PandaMINI Core Engine - Audio Engine (Rewritten)
-Bulletproof audio playback with synchronous loading, default drum sounds,
-and proper WASAPI/MME device handling.
+Audio engine: plays pad sounds (and the keyboard synth) to up to two outputs,
+the user's headphones and a virtual microphone cable (VB-Cable) for Discord/OBS.
+
+Threading
+- The GUI thread and the MIDI thread call trigger_pad(), release_pad(),
+  note_on() ... Those take a short lock and append commands to each output's
+  deque; they never touch audio buffers.
+- Every output has its own PortAudio callback thread that drains its deque and
+  mixes its own voices, so the two outputs never share play positions.
+- Decoding and resampling run on worker threads; results come back to the GUI
+  thread through a queued Qt signal.
 """
-import numpy as np
-import sounddevice as sd
-import soundfile as sf
-from pathlib import Path
-from typing import Dict, List, Optional, Any
-from PySide6.QtCore import QObject, Signal
+import collections
+import logging
+import math
 import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Dict, List, Optional
+
+import numpy as np
+from PySide6.QtCore import QObject, Signal, Slot
+
+from app.audio.decode import DecodeError, decode_file, resample
+
+try:
+    import sounddevice as sd
+except Exception as e:  # PortAudio missing
+    sd = None
+    _SD_ERROR = str(e)
+
+log = logging.getLogger(__name__)
+
+NUM_PADS = 8
+MODES = ("oneshot", "toggle", "hold", "loop")
+MAX_PAD_VOICES = 24
+FADE_SECONDS = 0.006
+# Seconds of audio queued ahead of the speakers. Enough headroom that a busy GUI
+# thread holding the GIL can't starve the callback, still tight enough for pads.
+OUTPUT_LATENCY = 0.03
+
+ROLE_HEADPHONES = "headphones"
+ROLE_MIC = "mic"
+ROLE_BOTH = "both"
+
+
+@dataclass
+class PadSettings:
+    volume: float = 0.8
+    mode: str = "oneshot"
+    to_headphones: bool = True
+    to_mic: bool = True
+
+
+class PadSound:
+    """A decoded sound plus resampled copies for each output rate."""
+
+    def __init__(self, data: np.ndarray, rate: int, path: str):
+        self.data = data
+        self.rate = rate
+        self.path = path
+        self.duration = data.shape[0] / float(rate)
+        self._cache: Dict[int, np.ndarray] = {rate: data}
+        self._lock = threading.Lock()
+
+    def at_rate(self, rate: int) -> np.ndarray:
+        with self._lock:
+            out = self._cache.get(rate)
+            if out is None:
+                out = resample(self.data, self.rate, rate)
+                self._cache[rate] = out
+            return out
+
+
+class _Voice:
+    __slots__ = ("pad", "data", "pos", "loop", "fade_left")
+
+    def __init__(self, pad: int, data: np.ndarray, loop: bool):
+        self.pad = pad
+        self.data = data
+        self.pos = 0
+        self.loop = loop
+        self.fade_left = None
+
+
+class _Synth:
+    """Small polyphonic synth for the piano keys (sine with a couple of harmonics)."""
+
+    MAX_VOICES = 16
+
+    def __init__(self, rate: int):
+        self.rate = rate
+        self.voices: List[list] = []  # [note, phase, inc, amp, env, releasing]
+        self.attack_step = 1.0 / max(1, int(0.005 * rate))
+        self.release_step = 1.0 / max(1, int(0.18 * rate))
+
+    def note_on(self, note: int, velocity: int) -> None:
+        self.note_off(note)
+        if len(self.voices) >= self.MAX_VOICES:
+            self.voices.pop(0)
+        freq = 440.0 * 2.0 ** ((note - 69) / 12.0)
+        amp = 0.18 * (0.25 + 0.75 * velocity / 127.0)
+        self.voices.append([note, 0.0, 2.0 * math.pi * freq / self.rate, amp, 0.0, False])
+
+    def note_off(self, note: int) -> None:
+        for v in self.voices:
+            if v[0] == note:
+                v[5] = True
+
+    def all_off(self) -> None:
+        for v in self.voices:
+            v[5] = True
+
+    def render(self, buf: np.ndarray, frames: int, gain: float) -> None:
+        if not self.voices:
+            return
+        t = np.arange(1, frames + 1, dtype=np.float64)
+        alive = []
+        for v in self.voices:
+            _, phase, inc, amp, env, releasing = v
+            ph = phase + inc * t
+            wave = np.sin(ph) + 0.3 * np.sin(2 * ph) + 0.12 * np.sin(3 * ph)
+            if releasing:
+                envs = np.maximum(env - self.release_step * t, 0.0)
+            else:
+                envs = np.minimum(env + self.attack_step * t, 1.0)
+            buf += (wave * envs * (amp * gain)).astype(np.float32)[:, None]
+            v[1] = float(ph[-1] % (2.0 * math.pi))
+            v[4] = float(envs[-1])
+            if not (releasing and v[4] <= 0.0):
+                alive.append(v)
+        self.voices = alive
+
+
+class OutputBus:
+    """One PortAudio output stream with its own voices and sound bank."""
+
+    def __init__(self, engine: "AudioEngine", role: str, device: Optional[int], name: str):
+        self.engine = engine
+        self.role = role
+        self.device = device
+        self.name = name
+        self.commands = collections.deque()
+        self.bank: List[Optional[np.ndarray]] = [None] * NUM_PADS
+        self.voices: List[_Voice] = []
+        self.synth: Optional[_Synth] = None
+        self.samplerate = 0
+        self.fade_frames = 1
+        self.stream = None
+        self.error = ""
+        self.peak = 0.0
+        self._buf = np.zeros((4096, 2), dtype=np.float32)
+
+    # ── lifecycle ───────────────────────────────────────────────
+
+    def open(self) -> bool:
+        if sd is None:
+            self.error = "Audio library missing (PortAudio)."
+            return False
+        last_error = "No usable output device."
+        for device, rate, extra in _stream_attempts(self.device):
+            self._prepare(rate)
+            try:
+                info = sd.query_devices(device if device is not None else sd.default.device[1])
+                channels = max(1, min(2, int(info["max_output_channels"])))
+                stream = sd.OutputStream(
+                    device=device, samplerate=rate, channels=channels, dtype="float32",
+                    latency=OUTPUT_LATENCY, extra_settings=extra, callback=self._callback,
+                )
+                stream.start()
+            except Exception as e:
+                last_error = str(e)
+                log.info("Output %s: device %s @ %s Hz failed: %s", self.role, device, rate, e)
+                continue
+            self.stream = stream
+            self.samplerate = int(stream.samplerate)
+            log.info("Output %s open: %s @ %d Hz (%s)", self.role, self.name, self.samplerate,
+                     _host_api_name(device))
+            return True
+        self.error = last_error
+        return False
+
+    def _prepare(self, rate: int) -> None:
+        self.samplerate = int(rate)
+        self.fade_frames = max(1, int(FADE_SECONDS * rate))
+        self.bank = [s.at_rate(self.samplerate) if s is not None else None
+                     for s in self.engine.sounds]
+        self.voices = []
+        self.commands.clear()
+        self.synth = _Synth(self.samplerate) if self.role in (ROLE_HEADPHONES, ROLE_BOTH) else None
+
+    def close(self) -> None:
+        stream, self.stream = self.stream, None
+        if stream is not None:
+            try:
+                stream.abort()
+                stream.close()
+            except Exception:
+                pass
+
+    @property
+    def running(self) -> bool:
+        try:
+            return self.stream is not None and bool(self.stream.active)
+        except Exception:
+            return False
+
+    # ── audio thread ────────────────────────────────────────────
+
+    def _callback(self, outdata, frames, time_info, status) -> None:
+        try:
+            self.mix(outdata, frames)
+        except Exception:
+            outdata.fill(0)
+            log.exception("Audio callback error on %s output", self.role)
+
+    def mix(self, outdata: np.ndarray, frames: int) -> None:
+        self._process_commands()
+        if self._buf.shape[0] < frames:
+            self._buf = np.zeros((frames, 2), dtype=np.float32)
+        buf = self._buf[:frames]
+        buf.fill(0.0)
+
+        if self.voices:
+            settings = self.engine.settings
+            self.voices = [v for v in self.voices
+                           if self._render_voice(v, buf, frames, settings[v.pad].volume)]
+            gain = self.engine.pad_gain(self.role)
+            if gain != 1.0:
+                buf *= gain
+        if self.synth is not None and self.synth.voices:
+            self.synth.render(buf, frames, self.engine.keys_gain())
+
+        np.clip(buf, -1.0, 1.0, out=buf)
+        if outdata.shape[1] == 1:
+            outdata[:, 0] = buf.mean(axis=1)
+        else:
+            outdata[:, :2] = buf
+            if outdata.shape[1] > 2:
+                outdata[:, 2:] = 0.0
+        if frames:
+            peak = float(np.max(np.abs(buf)))
+            if peak > self.peak:
+                self.peak = peak
+
+    def _render_voice(self, v: _Voice, buf: np.ndarray, frames: int, volume: float) -> bool:
+        data = v.data
+        total = data.shape[0]
+        if total == 0:
+            return False
+        out = 0
+        while out < frames:
+            if v.pos >= total:
+                if not v.loop:
+                    return False
+                v.pos = 0
+            n = min(frames - out, total - v.pos)
+            chunk = data[v.pos:v.pos + n]
+            if v.fade_left is None:
+                buf[out:out + n] += chunk * volume
+            else:
+                n = min(n, v.fade_left)
+                env = np.arange(v.fade_left, v.fade_left - n, -1, dtype=np.float32)
+                env *= volume / self.fade_frames
+                buf[out:out + n] += chunk[:n] * env[:, None]
+                v.fade_left -= n
+                if v.fade_left <= 0:
+                    return False
+            v.pos += n
+            out += n
+        return v.loop or v.pos < total
+
+    def _process_commands(self) -> None:
+        q = self.commands
+        while q:
+            try:
+                cmd = q.popleft()
+            except IndexError:
+                break
+            op = cmd[0]
+            if op == "start":
+                _, pad, loop = cmd
+                self._fade_pad(pad)
+                data = self.bank[pad]
+                if data is not None and self.engine.routes(pad, self.role):
+                    if len(self.voices) >= MAX_PAD_VOICES:
+                        self.voices.pop(0)
+                    self.voices.append(_Voice(pad, data, loop))
+            elif op == "stop":
+                self._fade_pad(cmd[1])
+            elif op == "stop_all":
+                for v in self.voices:
+                    if v.fade_left is None:
+                        v.fade_left = self.fade_frames
+                if self.synth is not None:
+                    self.synth.all_off()
+            elif op == "set":
+                _, pad, data = cmd
+                self.bank[pad] = data
+                self._fade_pad(pad)
+            elif op == "note_on" and self.synth is not None:
+                self.synth.note_on(cmd[1], cmd[2])
+            elif op == "note_off" and self.synth is not None:
+                self.synth.note_off(cmd[1])
+
+    def _fade_pad(self, pad: int) -> None:
+        for v in self.voices:
+            if v.pad == pad and v.fade_left is None:
+                v.fade_left = self.fade_frames
 
 
 class AudioEngine(QObject):
-    """
-    Audio engine with reliable pad playback.
-    
-    Key design decisions:
-    - Samples are loaded SYNCHRONOUSLY to guarantee they are ready before playback
-    - Built-in default drum sounds so pads always produce audio
-    - Buffer size adapts to actual callback frames (not pre-allocated)
-    - WASAPI used only when device supports it, with MME fallback
-    """
-    
-    stream_started = Signal()
-    stream_stopped = Signal()
-    audio_error = Signal(str)
-    vu_update = Signal(float)
-    pad_loaded = Signal(int, str)  # pad_index, path
-    
-    NUM_PADS = 8
-    
-    def __init__(self, config_manager: Optional[Any] = None, parent: Optional[QObject] = None):
+    """Owns the output buses, the pad sounds and the play state of every pad."""
+
+    pad_loaded = Signal(int, bool, str, str)   # pad, ok, path (ok) / message (failed), request path
+    _load_done = Signal(int, int, object, str, str)
+
+    def __init__(self, parent: Optional[QObject] = None):
         super().__init__(parent)
-        self._config_manager = config_manager
-        
-        self._sample_rate = 44100  # Use 44100 for maximum compatibility
-        self._blocksize = 512
-        self._latency = 'low'
-        
-        # Voice management (import lazily to avoid circular imports)
-        from app.audio.voice import VoiceManager
-        self._voice_manager = VoiceManager()
-        
-        # Sample loader (kept for API compatibility but we load synchronously)
-        from app.audio.loader import SampleLoader
-        self._sample_loader = SampleLoader()
-        
-        # Loaded samples for sampler voices
-        self._sampler_samples: Dict[int, np.ndarray] = {}
-        
-        # Soundboard pad samples and paths
-        self._pad_samples: Dict[int, np.ndarray] = {}
-        self._pad_sample_paths: Dict[int, str] = {}
-        
-        # Play positions (one set — plays to ALL active streams)
-        self._pad_play_pos: Dict[int, int] = {i: 0 for i in range(self.NUM_PADS)}
-        self._pad_active: Dict[int, bool] = {i: False for i in range(self.NUM_PADS)}
-        self._pad_gate_held: Dict[int, bool] = {i: False for i in range(self.NUM_PADS)}
-        
-        # For backward compat with UI code that reads these
-        self._pad_active_mon = self._pad_active
-        self._pad_active_mic = self._pad_active
-        self._pad_play_pos_mon = self._pad_play_pos
-        self._pad_play_pos_mic = self._pad_play_pos
-        
-        # Pad config
-        self._pad_volumes: Dict[int, float] = {i: 1.0 for i in range(self.NUM_PADS)}
-        self._pad_modes: Dict[int, str] = {i: 'oneshot' for i in range(self.NUM_PADS)}
-        self._pad_route_mic: Dict[int, bool] = {i: True for i in range(self.NUM_PADS)}
-        self._pad_route_mon: Dict[int, bool] = {i: True for i in range(self.NUM_PADS)}
-        
-        # Stream references
-        self._sampler_stream: Optional[sd.OutputStream] = None
-        self._soundboard_stream: Optional[sd.OutputStream] = None
-        
-        # Output devices
-        self._sampler_device: Optional[int] = None
-        self._soundboard_device: Optional[int] = None
-        
-        # Level metering
-        self._current_level = 0.0
-        self._level_lock = threading.Lock()
-        
-        self._is_running = False
-        
-        # Generate built-in default drum sounds
-        self._generate_default_sounds()
-        
-        # Load pad configs from file
-        if self._config_manager:
-            self._load_pads_from_config()
-    
-    # ──────────────────────────────────────────────
-    # Default sounds — pads always produce audio
-    # ──────────────────────────────────────────────
-    
-    def _generate_default_sounds(self) -> None:
-        """Generate 8 built-in drum sounds so pads work immediately."""
-        sr = self._sample_rate
-        
-        # Pad 1: Kick drum
-        t = np.linspace(0, 0.4, int(sr * 0.4), dtype=np.float32)
-        freq = 150 * np.exp(-t * 8) + 40
-        phase = np.cumsum(freq / sr) * 2 * np.pi
-        kick = np.sin(phase) * np.exp(-t * 6) * 0.9
-        
-        # Pad 2: Snare
-        t = np.linspace(0, 0.25, int(sr * 0.25), dtype=np.float32)
-        noise = np.random.randn(len(t)).astype(np.float32)
-        tone = np.sin(2 * np.pi * 200 * t) * np.exp(-t * 20)
-        snare = (noise * 0.4 + tone * 0.6) * np.exp(-t * 10) * 0.8
-        
-        # Pad 3: Closed hi-hat
-        t = np.linspace(0, 0.08, int(sr * 0.08), dtype=np.float32)
-        hh = np.random.randn(len(t)).astype(np.float32) * np.exp(-t * 40) * 0.6
-        
-        # Pad 4: Open hi-hat
-        t = np.linspace(0, 0.3, int(sr * 0.3), dtype=np.float32)
-        ohh = np.random.randn(len(t)).astype(np.float32) * np.exp(-t * 8) * 0.5
-        
-        # Pad 5: Clap
-        t = np.linspace(0, 0.2, int(sr * 0.2), dtype=np.float32)
-        clap_env = np.zeros_like(t)
-        for burst_start in [0.0, 0.015, 0.03]:
-            mask = t >= burst_start
-            clap_env[mask] += np.exp(-(t[mask] - burst_start) * 30)
-        clap = np.random.randn(len(t)).astype(np.float32) * clap_env * 0.3
-        
-        # Pad 6: Tom
-        t = np.linspace(0, 0.35, int(sr * 0.35), dtype=np.float32)
-        tom_freq = 120 * np.exp(-t * 5) + 60
-        tom_phase = np.cumsum(tom_freq / sr) * 2 * np.pi
-        tom = np.sin(tom_phase) * np.exp(-t * 7) * 0.8
-        
-        # Pad 7: Rim shot
-        t = np.linspace(0, 0.06, int(sr * 0.06), dtype=np.float32)
-        rim = (np.sin(2 * np.pi * 800 * t) * 0.5 + 
-               np.random.randn(len(t)).astype(np.float32) * 0.3) * np.exp(-t * 50) * 0.7
-        
-        # Pad 8: Cymbal crash
-        t = np.linspace(0, 0.8, int(sr * 0.8), dtype=np.float32)
-        cymbal = np.random.randn(len(t)).astype(np.float32) * np.exp(-t * 3) * 0.4
-        
-        defaults = [kick, snare, hh, ohh, clap, tom, rim, cymbal]
-        default_names = ["Kick", "Snare", "HiHat-C", "HiHat-O", "Clap", "Tom", "Rim", "Crash"]
-        
-        for i, (sound, name) in enumerate(zip(defaults, default_names)):
-            sound = sound.astype(np.float32)
-            # Only set if no user sample is already loaded
-            if i not in self._pad_samples:
-                self._pad_samples[i] = sound
-                self._pad_sample_paths[i] = f"(Built-in: {name})"
-        
-        print(f"[AudioEngine] Generated {len(defaults)} built-in drum sounds")
-    
-    # ──────────────────────────────────────────────
-    # Config loading
-    # ──────────────────────────────────────────────
-    
-    def _load_pads_from_config(self) -> None:
-        """Load pad settings from ConfigManager on startup."""
-        for i in range(self.NUM_PADS):
-            vol = self._config_manager.get('pads', 'volumes', i, default=1.0)
-            self._pad_volumes[i] = float(vol)
-            
-            mode = self._config_manager.get('pads', 'modes', i, default='oneshot')
-            self._pad_modes[i] = str(mode)
-            
-            mic = self._config_manager.get('pads', 'route_mic', i, default=True)
-            self._pad_route_mic[i] = bool(mic)
-            
-            mon = self._config_manager.get('pads', 'route_mon', i, default=True)
-            self._pad_route_mon[i] = bool(mon)
-            
-            # Load user sample if path exists (synchronously!)
-            path = self._config_manager.get('pads', 'samples', i)
-            if path and Path(path).exists():
-                self._load_sample_sync(i, path)
-    
-    # ──────────────────────────────────────────────
-    # Properties
-    # ──────────────────────────────────────────────
-    
-    @property
-    def voice_manager(self):
-        return self._voice_manager
-    
-    @property
-    def sample_loader(self):
-        return self._sample_loader
-    
-    # ──────────────────────────────────────────────
-    # Device management
-    # ──────────────────────────────────────────────
-    
-    def get_available_devices(self) -> List[Dict]:
-        """Get list of available audio output devices."""
-        try:
-            devices = sd.query_devices()
-            output_devices = []
-            for i, dev in enumerate(devices):
-                if dev['max_output_channels'] > 0:
-                    output_devices.append({
-                        'index': i,
-                        'name': dev['name'],
-                        'channels': dev['max_output_channels'],
-                        'sample_rate': int(dev['default_samplerate']),
-                    })
-            return output_devices
-        except Exception as e:
-            self.audio_error.emit(f"Error querying devices: {e}")
+        self.settings = [PadSettings() for _ in range(NUM_PADS)]
+        self.sounds: List[Optional[PadSound]] = [None] * NUM_PADS
+        self.levels = {"headphones": 0.8, "mic": 0.8, "keys": 0.6, "master": 1.0}
+        self._buses: tuple = ()
+        self._lock = threading.Lock()
+        self._play_until = [0.0] * NUM_PADS
+        self._started = [0.0] * NUM_PADS
+        self._tokens = [0] * NUM_PADS
+        self._load_done.connect(self._on_load_done)
+
+    # ── outputs ─────────────────────────────────────────────────
+
+    @staticmethod
+    def list_outputs() -> List[str]:
+        """Output device names, one entry per device (preferring the WASAPI list on Windows)."""
+        if sd is None:
             return []
-    
-    def _resolve_device(self, device_name_or_index) -> Optional[int]:
-        """Resolve a device name string to its sounddevice index."""
-        if device_name_or_index is None:
-            return None
-        if isinstance(device_name_or_index, int):
-            return device_name_or_index
         try:
-            devices = sd.query_devices()
-            for i, dev in enumerate(devices):
-                if dev['max_output_channels'] > 0 and device_name_or_index in dev['name']:
-                    return i
-        except Exception:
-            pass
+            api = _preferred_host_api()
+            names = []
+            for i, dev in enumerate(sd.query_devices()):
+                if dev["max_output_channels"] > 0 and (api is None or dev["hostapi"] == api):
+                    if dev["name"] not in names:
+                        names.append(dev["name"])
+            return names
+        except Exception as e:
+            log.warning("Could not list audio devices: %s", e)
+            return []
+
+    @staticmethod
+    def find_output(fragment: str) -> Optional[str]:
+        for name in AudioEngine.list_outputs():
+            if fragment.lower() in name.lower():
+                return name
         return None
-    
-    def _is_wasapi_device(self, device_index: int) -> bool:
-        """Check if a device belongs to the WASAPI host API."""
-        if device_index is None:
-            return False
-        try:
-            dev_info = sd.query_devices(device_index)
-            host_api = sd.query_hostapis(dev_info['hostapi'])
-            return 'WASAPI' in host_api['name']
-        except Exception:
-            return False
-    
-    # ──────────────────────────────────────────────
-    # Stream management
-    # ──────────────────────────────────────────────
-    
-    def _open_stream(self, device_idx, callback, label: str) -> Optional[sd.OutputStream]:
-        """Try to open an output stream, with WASAPI fallback to MME."""
-        # Attempt 1: with WASAPI if applicable
-        if device_idx is not None and self._is_wasapi_device(device_idx):
-            try:
-                extra = sd.WasapiSettings(exclusive=False)
-                stream = sd.OutputStream(
-                    device=device_idx,
-                    samplerate=self._sample_rate,
-                    blocksize=self._blocksize,
-                    latency=self._latency,
-                    channels=2,
-                    dtype=np.float32,
-                    extra_settings=extra,
-                    callback=callback,
-                )
-                stream.start()
-                print(f"[AudioEngine] {label} stream started (WASAPI) on device {device_idx}")
-                return stream
-            except Exception as e:
-                print(f"[AudioEngine] {label} WASAPI failed: {e}")
-        
-        # Attempt 2: plain stream (no WASAPI settings)
-        try:
-            stream = sd.OutputStream(
-                device=device_idx,
-                samplerate=self._sample_rate,
-                blocksize=self._blocksize,
-                latency=self._latency,
-                channels=2,
-                dtype=np.float32,
-                callback=callback,
-            )
-            stream.start()
-            print(f"[AudioEngine] {label} stream started (MME) on device {device_idx}")
-            return stream
-        except Exception as e:
-            print(f"[AudioEngine] {label} MME also failed: {e}")
-        
-        # Attempt 3: let sounddevice pick everything (no device, no samplerate)
-        try:
-            stream = sd.OutputStream(
-                channels=2,
-                dtype=np.float32,
-                callback=callback,
-            )
-            stream.start()
-            self._sample_rate = int(stream.samplerate)
-            print(f"[AudioEngine] {label} stream started (auto) sr={self._sample_rate}")
-            return stream
-        except Exception as e:
-            print(f"[AudioEngine] {label} auto-config also failed: {e}")
-            return None
-    
-    def start_streams(self, sampler_device=None, soundboard_device=None) -> bool:
-        """Start audio output streams."""
-        if self._is_running:
-            return True
-        
-        sampler_idx = self._resolve_device(sampler_device)
-        soundboard_idx = self._resolve_device(soundboard_device)
-        
-        self._sampler_device = sampler_idx
-        self._soundboard_device = soundboard_idx
-        
-        # Start sampler/monitor stream (this is the main audio output)
-        self._sampler_stream = self._open_stream(sampler_idx, self._sampler_callback, "Sampler")
-        
-        # Start soundboard/discord stream only if it's a different device
-        if soundboard_idx is not None and soundboard_idx != sampler_idx:
-            self._soundboard_stream = self._open_stream(soundboard_idx, self._soundboard_callback, "Soundboard")
+
+    def set_outputs(self, headphones: Optional[str], mic: Optional[str]) -> Dict[str, str]:
+        """(Re)open the outputs. headphones=None means system default; mic=None/'' means off.
+
+        Returns {role: error message} for outputs that failed to open.
+        """
+        self.close()
+        hp_index = _resolve_output(headphones) if headphones else _default_output()
+        hp_name = headphones or "System default"
+        mic_index = _resolve_output(mic) if mic else None
+        errors = {}
+        if headphones and hp_index is None:
+            errors[ROLE_HEADPHONES] = f"'{headphones}' was not found; using the system default."
+            hp_index, hp_name = _default_output(), "System default"
+        if mic and mic_index is None:
+            errors[ROLE_MIC] = f"'{mic}' was not found."
+
+        if mic_index is not None and mic_index == hp_index:
+            buses = [OutputBus(self, ROLE_BOTH, hp_index, hp_name)]
         else:
-            self._soundboard_stream = None
-            print("[AudioEngine] Soundboard shares sampler device, skipping separate stream")
-        
-        if self._sampler_stream:
-            self._is_running = True
-            self.stream_started.emit()
-            print(f"[AudioEngine] Engine is RUNNING. Pads loaded: {list(self._pad_samples.keys())}")
-            return True
-        else:
-            self.audio_error.emit("Failed to start audio stream")
-            return False
-    
-    def stop_streams(self) -> None:
-        """Stop both output streams."""
-        self._is_running = False
-        for stream_attr in ('_sampler_stream', '_soundboard_stream'):
-            stream = getattr(self, stream_attr, None)
-            if stream:
-                try:
-                    stream.stop()
-                    stream.close()
-                except Exception:
-                    pass
-                setattr(self, stream_attr, None)
-        self.stream_stopped.emit()
-    
-    # ──────────────────────────────────────────────
-    # Pad triggering
-    # ──────────────────────────────────────────────
-    
-    def trigger_pad(self, pad_index: int) -> None:
-        """Trigger a soundboard pad playback."""
-        if not (0 <= pad_index < self.NUM_PADS):
-            return
-        
-        has_sample = pad_index in self._pad_samples
-        print(f"[AudioEngine] trigger_pad({pad_index}) has_sample={has_sample} running={self._is_running}")
-        
-        if not has_sample:
-            return
-        
-        mode = self._pad_modes.get(pad_index, 'oneshot')
-        
-        if mode == 'loop' and self._pad_active[pad_index]:
-            # Toggle off
-            self._pad_active[pad_index] = False
-        else:
-            self._pad_play_pos[pad_index] = 0
-            self._pad_active[pad_index] = True
-            if mode == 'gate':
-                self._pad_gate_held[pad_index] = True
-    
-    def release_pad(self, pad_index: int) -> None:
-        """Release a soundboard pad (for Gate mode)."""
-        if 0 <= pad_index < self.NUM_PADS:
-            self._pad_gate_held[pad_index] = False
-            if self._pad_modes[pad_index] == 'gate':
-                self._pad_active[pad_index] = False
-    
-    def trigger_synth_note(self, note: int, velocity: int) -> None:
-        """Trigger a synth note."""
-        self._voice_manager.note_on(note, velocity)
-    
-    def release_synth_note(self, note: int) -> None:
-        """Release a synth note."""
-        self._voice_manager.note_off(note)
-    
-    # ──────────────────────────────────────────────
-    # Sample loading (SYNCHRONOUS — guaranteed ready)
-    # ──────────────────────────────────────────────
-    
-    def _load_sample_sync(self, pad_index: int, file_path: str) -> bool:
-        """Load an audio file synchronously. Returns True on success."""
-        try:
-            path = Path(file_path)
-            if not path.exists():
-                try:
-                    print(f"[AudioEngine] File not found: {file_path}")
-                except UnicodeEncodeError:
-                    print("[AudioEngine] File not found (path contains special characters)")
-                return False
-            
-            data, file_sr = sf.read(str(path), dtype='float32')
-            
-            # Convert stereo to mono
-            if len(data.shape) > 1:
-                data = data.mean(axis=1)
-            
-            # Resample if needed
-            if file_sr != self._sample_rate:
-                # Simple linear interpolation resampling
-                ratio = self._sample_rate / file_sr
-                new_len = int(len(data) * ratio)
-                indices = np.linspace(0, len(data) - 1, new_len)
-                data = np.interp(indices, np.arange(len(data)), data).astype(np.float32)
-            
-            # Normalize
-            peak = np.max(np.abs(data))
-            if peak > 0:
-                data = data / peak * 0.9
-            
-            self._pad_samples[pad_index] = data
-            self._pad_sample_paths[pad_index] = str(path)
-            
-            try:
-                print(f"[AudioEngine] Loaded pad {pad_index}: {path.name} ({len(data)} samples, {len(data)/self._sample_rate:.2f}s)")
-            except UnicodeEncodeError:
-                print(f"[AudioEngine] Loaded pad {pad_index}: (unicode name) ({len(data)} samples)")
-            return True
-            
-        except Exception as e:
-            try:
-                print(f"[AudioEngine] Failed to load {file_path}: {e}")
-            except UnicodeEncodeError:
-                print(f"[AudioEngine] Failed to load sample for pad {pad_index}: {e}")
-            return False
-    
-    def load_pad_sample(self, pad_index: int, sample_path: str) -> None:
-        """Load a sample for a drum pad (synchronously)."""
-        if self._load_sample_sync(pad_index, sample_path):
-            # Save to config (on main thread, safe for QTimer)
-            if self._config_manager:
-                self._config_manager.set(sample_path, 'pads', 'samples', pad_index)
-            self.pad_loaded.emit(pad_index, sample_path)
-    
-    def load_sampler_sample(self, note: int, sample_path: str) -> None:
-        """Load a sample for a specific MIDI note."""
-        try:
-            data, file_sr = sf.read(sample_path, dtype='float32')
-            if len(data.shape) > 1:
-                data = data.mean(axis=1)
-            self._sampler_samples[note] = data
-        except Exception as e:
-            print(f"[AudioEngine] Failed to load sampler sample: {e}")
-    
-    # ──────────────────────────────────────────────
-    # Pad configuration
-    # ──────────────────────────────────────────────
-    
-    def set_pad_volume(self, pad_index: int, volume: float) -> None:
-        if 0 <= pad_index < self.NUM_PADS:
-            self._pad_volumes[pad_index] = volume
-            if self._config_manager:
-                self._config_manager.set(volume, 'pads', 'volumes', pad_index)
-                
-    def set_pad_mode(self, pad_index: int, mode: str) -> None:
-        if 0 <= pad_index < self.NUM_PADS:
-            self._pad_modes[pad_index] = mode
-            if self._config_manager:
-                self._config_manager.set(mode, 'pads', 'modes', pad_index)
-                
-    def set_pad_routing(self, pad_index: int, route_mic: bool, route_mon: bool) -> None:
-        if 0 <= pad_index < self.NUM_PADS:
-            self._pad_route_mic[pad_index] = route_mic
-            self._pad_route_mon[pad_index] = route_mon
-            if self._config_manager:
-                self._config_manager.set(route_mic, 'pads', 'route_mic', pad_index)
-                self._config_manager.set(route_mon, 'pads', 'route_mon', pad_index)
-    
-    # ──────────────────────────────────────────────
-    # Audio callbacks
-    # ──────────────────────────────────────────────
-    
-    def _sampler_callback(self, outdata: np.ndarray, frames: int,
-                          time_info: dict, status: sd.CallbackFlags) -> None:
-        """Main audio callback — mixes synth voices and pad samples."""
-        if not self._is_running:
-            outdata.fill(0)
-            return
-        
-        # Create mix buffer matching actual frame count
-        mix = np.zeros(frames, dtype=np.float32)
-        
-        # --- Synth voices ---
-        active_voices = 0
-        for voice in self._voice_manager._voices:
-            if not voice.is_active:
-                continue
-            active_voices += 1
-            note_diff = voice.note - 60
-            step = pow(2.0, note_diff / 12.0)
-            
-            sample = self._sampler_samples.get(voice.note)
-            if sample is not None:
-                sample_len = len(sample)
-                pos = int(voice.play_pos)
-                end = min(pos + frames, sample_len)
-                n = end - pos
-                if n > 0 and pos >= 0:
-                    mix[:n] += sample[pos:end] * voice.velocity
-                voice.play_pos += frames
-                if voice.play_pos >= sample_len:
-                    voice.is_active = False
+            buses = [OutputBus(self, ROLE_HEADPHONES, hp_index, hp_name)]
+            if mic_index is not None:
+                buses.append(OutputBus(self, ROLE_MIC, mic_index, mic))
+
+        opened = []
+        for bus in buses:
+            if bus.open():
+                opened.append(bus)
             else:
-                # Sine wave synth
-                freq = 440.0 * step
-                t = (voice.play_pos + np.arange(frames)) / self._sample_rate
-                wave = np.sin(2.0 * np.pi * freq * t).astype(np.float32)
-                mix += wave * voice.velocity * 0.3
-                voice.play_pos += frames
-            
-            if voice.is_releasing:
-                release_frames = int(0.05 * self._sample_rate)
-                progress = (voice.play_pos - voice.release_start) / max(release_frames, 1)
-                if progress >= 1.0:
-                    voice.is_active = False
-                    voice.is_releasing = False
-        
-        # --- Drum pad samples ---
-        for pad_idx in range(self.NUM_PADS):
-            if not self._pad_active[pad_idx]:
-                continue
-            
-            sample = self._pad_samples.get(pad_idx)
-            if sample is None:
-                self._pad_active[pad_idx] = False
-                continue
-            
-            pos = self._pad_play_pos[pad_idx]
-            sample_len = len(sample)
-            
-            if pos >= sample_len:
-                if self._pad_modes[pad_idx] == 'loop':
-                    pos = 0
-                    self._pad_play_pos[pad_idx] = 0
-                else:
-                    self._pad_active[pad_idx] = False
-                    continue
-            
-            end = min(pos + frames, sample_len)
-            n = end - pos
-            if n > 0:
-                vol = self._pad_volumes.get(pad_idx, 1.0)
-                mix[:n] += sample[pos:end] * vol
-            
-            self._pad_play_pos[pad_idx] = end
-            
-            if end >= sample_len and self._pad_modes[pad_idx] != 'loop':
-                self._pad_active[pad_idx] = False
-        
-        # Normalize
-        if active_voices > 1:
-            mix *= 1.0 / np.sqrt(active_voices)
-        
-        # Apply master gain
-        mix *= 0.8
-        
-        # Clamp
-        np.clip(mix, -1.0, 1.0, out=mix)
-        
-        # Level meter
-        peak = float(np.max(np.abs(mix)))
-        with self._level_lock:
-            self._current_level = peak
-        
-        # Write to stereo output
-        outdata[:, 0] = mix
-        outdata[:, 1] = mix
-    
-    def _soundboard_callback(self, outdata: np.ndarray, frames: int,
-                             time_info: dict, status: sd.CallbackFlags) -> None:
-        """Soundboard callback for Discord/virtual cable output."""
-        if not self._is_running:
-            outdata.fill(0)
+                role = ROLE_HEADPHONES if bus.role == ROLE_BOTH else bus.role
+                errors[role] = f"Couldn't open '{bus.name}': {bus.error}"
+        with self._lock:
+            self._buses = tuple(opened)
+        return errors
+
+    def close(self) -> None:
+        with self._lock:
+            buses, self._buses = self._buses, ()
+            self._play_until = [0.0] * NUM_PADS
+        for bus in buses:
+            bus.close()
+
+    def output_state(self) -> Dict[str, dict]:
+        """{role: {'running': bool, 'peak': float}} — reading resets the peaks."""
+        state = {}
+        for bus in self._buses:
+            peak, bus.peak = bus.peak, 0.0
+            roles = (ROLE_HEADPHONES, ROLE_MIC) if bus.role == ROLE_BOTH else (bus.role,)
+            for role in roles:
+                state[role] = {"running": bus.running, "peak": peak}
+        return state
+
+    # ── gains (read by the audio threads) ───────────────────────
+
+    def pad_gain(self, role: str) -> float:
+        lv = self.levels
+        key = "mic" if role == ROLE_MIC else "headphones"
+        return lv[key] * lv["master"]
+
+    def keys_gain(self) -> float:
+        return self.levels["keys"] * self.levels["master"]
+
+    def routes(self, pad: int, role: str) -> bool:
+        s = self.settings[pad]
+        if role == ROLE_HEADPHONES:
+            return s.to_headphones
+        if role == ROLE_MIC:
+            return s.to_mic
+        return s.to_headphones or s.to_mic
+
+    # ── pads ────────────────────────────────────────────────────
+
+    def trigger_pad(self, pad: int) -> str:
+        """Hit a pad. Returns 'started', 'stopped' or 'empty'. Safe from any thread."""
+        if not 0 <= pad < NUM_PADS:
+            return "empty"
+        with self._lock:
+            sound = self.sounds[pad]
+            if sound is None:
+                return "empty"
+            mode = self.settings[pad].mode
+            now = time.monotonic()
+            if mode in ("toggle", "loop") and now < self._play_until[pad]:
+                self._send(("stop", pad))
+                self._play_until[pad] = 0.0
+                return "stopped"
+            loop = mode == "loop"
+            self._send(("start", pad, loop))
+            self._started[pad] = now
+            self._play_until[pad] = math.inf if loop else now + sound.duration
+            return "started"
+
+    def release_pad(self, pad: int) -> None:
+        if not 0 <= pad < NUM_PADS:
             return
-        
-        mix = np.zeros(frames, dtype=np.float32)
-        
-        for pad_idx in range(self.NUM_PADS):
-            if not self._pad_active[pad_idx] or not self._pad_route_mic.get(pad_idx, True):
-                continue
-            
-            sample = self._pad_samples.get(pad_idx)
-            if sample is None:
-                continue
-            
-            pos = self._pad_play_pos[pad_idx]
-            sample_len = len(sample)
-            
-            if pos >= sample_len:
-                continue
-            
-            end = min(pos + frames, sample_len)
-            n = end - pos
-            if n > 0:
-                vol = self._pad_volumes.get(pad_idx, 1.0)
-                mix[:n] += sample[pos:end] * vol
-        
-        np.clip(mix, -1.0, 1.0, out=mix)
-        outdata[:, 0] = mix
-        outdata[:, 1] = mix
-    
-    # ──────────────────────────────────────────────
-    # Utility
-    # ──────────────────────────────────────────────
-    
-    def get_current_level(self) -> float:
-        with self._level_lock:
-            return self._current_level
-    
-    def all_notes_off(self) -> None:
-        self._voice_manager.all_notes_off()
-    
-    def cleanup(self) -> None:
-        self.stop_streams()
-        self._sample_loader.clear_all()
+        with self._lock:
+            if self.settings[pad].mode == "hold" and self._play_until[pad] > 0.0:
+                self._send(("stop", pad))
+                self._play_until[pad] = 0.0
+
+    def stop_pad(self, pad: int) -> None:
+        with self._lock:
+            self._send(("stop", pad))
+            self._play_until[pad] = 0.0
+
+    def stop_all(self) -> None:
+        with self._lock:
+            self._send(("stop_all",))
+            self._play_until = [0.0] * NUM_PADS
+
+    def is_playing(self, pad: int) -> bool:
+        return time.monotonic() < self._play_until[pad]
+
+    def progress(self, pad: int) -> float:
+        """0..1 position of the pad's current playback (0 when idle)."""
+        sound = self.sounds[pad]
+        if sound is None or not self.is_playing(pad) or sound.duration <= 0:
+            return 0.0
+        elapsed = time.monotonic() - self._started[pad]
+        return (elapsed % sound.duration) / sound.duration
+
+    def _send(self, cmd: tuple) -> None:
+        for bus in self._buses:
+            bus.commands.append(cmd)
+
+    # ── keyboard synth ──────────────────────────────────────────
+
+    def note_on(self, note: int, velocity: int = 100) -> None:
+        self._send(("note_on", int(note), int(velocity)))
+
+    def note_off(self, note: int) -> None:
+        self._send(("note_off", int(note)))
+
+    # ── loading sounds ──────────────────────────────────────────
+
+    def load_pad(self, pad: int, path: str,
+                 import_fn: Optional[Callable[[Path], Path]] = None) -> None:
+        """Decode `path` on a worker thread, then put it on the pad.
+
+        import_fn (optional) runs on the worker after a successful decode and
+        returns the path to remember (e.g. a copy in the sound library).
+        Emits pad_loaded(pad, ok, stored path or error message, requested path).
+        """
+        self._tokens[pad] += 1
+        token = self._tokens[pad]
+        rates = {bus.samplerate for bus in self._buses if bus.samplerate}
+
+        def work():
+            try:
+                data, rate = decode_file(path)
+                sound = PadSound(data, rate, str(path))
+                for r in rates:
+                    sound.at_rate(r)
+                stored = Path(path)
+                if import_fn is not None:
+                    stored = import_fn(stored)
+                sound.path = str(stored)
+                self._load_done.emit(pad, token, sound, "", str(path))
+            except DecodeError as e:
+                self._load_done.emit(pad, token, None, str(e), str(path))
+            except Exception as e:
+                log.exception("Loading %s failed", path)
+                self._load_done.emit(pad, token, None, f"Couldn't load this file ({e}).", str(path))
+
+        threading.Thread(target=work, name=f"load-pad-{pad + 1}", daemon=True).start()
+
+    @Slot(int, int, object, str, str)
+    def _on_load_done(self, pad: int, token: int, sound, message: str, requested: str) -> None:
+        if token != self._tokens[pad]:
+            return  # a newer load or a clear replaced this one
+        if sound is None:
+            self.pad_loaded.emit(pad, False, message, requested)
+            return
+        self._install(pad, sound)
+        self.pad_loaded.emit(pad, True, sound.path, requested)
+
+    def clear_pad(self, pad: int) -> None:
+        self._tokens[pad] += 1
+        self._install(pad, None)
+
+    def _install(self, pad: int, sound: Optional[PadSound]) -> None:
+        prepared = [(bus, sound.at_rate(bus.samplerate) if sound else None) for bus in self._buses]
+        with self._lock:
+            self.sounds[pad] = sound
+            self._play_until[pad] = 0.0
+            for bus, data in prepared:
+                bus.commands.append(("set", pad, data))
+
+
+# ── PortAudio helpers ───────────────────────────────────────────
+
+
+def _preferred_host_api() -> Optional[int]:
+    """WASAPI on Windows (low latency, full device names); otherwise the default API."""
+    try:
+        for i, api in enumerate(sd.query_hostapis()):
+            if "WASAPI" in api["name"]:
+                return i
+        return sd.default.hostapi
+    except Exception:
+        return None
+
+
+def _host_api_name(device: Optional[int]) -> str:
+    try:
+        idx = device if device is not None else sd.default.device[1]
+        return sd.query_hostapis(sd.query_devices(idx)["hostapi"])["name"]
+    except Exception:
+        return "?"
+
+
+def _default_output() -> Optional[int]:
+    if sd is None:
+        return None
+    try:
+        api = _preferred_host_api()
+        if api is not None:
+            idx = sd.query_hostapis(api)["default_output_device"]
+            if idx is not None and idx >= 0:
+                return idx
+        idx = sd.default.device[1]
+        return idx if idx is not None and idx >= 0 else None
+    except Exception:
+        return None
+
+
+def _resolve_output(name: str) -> Optional[int]:
+    """Device index for a saved name: exact match in the preferred API, then looser matches."""
+    if sd is None or not name:
+        return None
+    try:
+        devices = list(enumerate(sd.query_devices()))
+    except Exception:
+        return None
+    api = _preferred_host_api()
+    outputs = [(i, d) for i, d in devices if d["max_output_channels"] > 0]
+    preferred = [(i, d) for i, d in outputs if api is None or d["hostapi"] == api]
+    for pool in (preferred, outputs):
+        for i, d in pool:
+            if d["name"] == name:
+                return i
+    for pool in (preferred, outputs):
+        for i, d in pool:
+            if d["name"].startswith(name) or name.startswith(d["name"]):
+                return i
+    return None
+
+
+def _stream_attempts(device: Optional[int]):
+    """Ways to open `device`, best first: native rate, WASAPI auto-convert, same device on MME."""
+    try:
+        info = sd.query_devices(device if device is not None else sd.default.device[1])
+    except Exception:
+        return
+    rate = int(info["default_samplerate"] or 48000)
+    yield device, rate, None
+    api_name = _host_api_name(device)
+    if "WASAPI" in api_name:
+        try:
+            yield device, 48000, sd.WasapiSettings(auto_convert=True)
+        except TypeError:
+            pass
+    for i, d in enumerate(sd.query_devices()):
+        if i == device or d["max_output_channels"] <= 0:
+            continue
+        other_api = sd.query_hostapis(d["hostapi"])["name"]
+        if "MME" in other_api and (info["name"].startswith(d["name"]) or d["name"].startswith(info["name"])):
+            yield i, int(d["default_samplerate"] or 44100), None
+            break
